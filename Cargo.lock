@@ -87,6 +87,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ac45299ccbd390721be55b412d41931911f654fa99e2cb8bfb57184b2061fe"
+
+[[package]]
 name = "syn"
 version = "2.0.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -111,4 +117,5 @@ dependencies = [
  "error-stack",
  "fastrand",
  "serde",
+ "siphasher",
 ]

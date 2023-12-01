@@ -1,6 +1,7 @@
 use crate::constants::PAGE_SIZE;
 use crate::storage::{engine::IoResult, log_manager::ValueLog, storage_interface::Page};
 use bincode;
+use serde::Serialize;
 use std::cmp::min;
 use std::{
     cmp::max,
@@ -20,7 +21,11 @@ pub struct Pager<P: Page> {
 
 impl<P: Page> Pager<P> {
     pub fn new(path_str: &str) -> IoResult<Self> {
-        let file = OpenOptions::new().write(true).read(true).open(&path_str)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(&path_str)?;
 
         Ok(Self {
             file,
@@ -55,8 +60,8 @@ impl<P: Page> Pager<P> {
         Ok(())
     }
 
-    pub fn append_to_page(&mut self, log: &ValueLog) -> IoResult<AppendInfo> {
-        let bytes = bincode::serialize::<ValueLog>(log)
+    pub fn append_to_page<T: Serialize>(&mut self, val: &T) -> IoResult<AppendInfo> {
+        let bytes = bincode::serialize(val)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         let size = bytes.as_slice().len();
