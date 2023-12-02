@@ -1,110 +1,12 @@
-use super::{bloom_filter::BloomFilter, engine::IoResult, pager::Pager, storage_interface::Page};
+use super::{
+    bloom_filter::BloomFilter, engine::IoResult, pager::Pager, storage_interface::Page,
+    storage_types as types,
+};
 use crate::constants::{
-    BUCKET_CHILDREN, DUMMY_SORTED_TABLE_FILE_SIZE, FILTER_FP_RATE, PAGE_SIZE,
-    SORTED_TABLE_FILTER_ITEM_COUNT,
+    DUMMY_SORTED_TABLE_FILE_SIZE, FILTER_FP_RATE, PAGE_SIZE, SORTED_TABLE_FILTER_ITEM_COUNT,
 };
 use bincode;
-use serde::{Deserialize, Serialize};
 use std::io;
-
-#[derive(Debug, Clone)]
-pub struct SortedStorePage {
-    pub id: u64,
-    pub bytes: [u8; PAGE_SIZE],
-}
-
-impl SortedStorePage {}
-
-impl Page for SortedStorePage {
-    fn new(id: u64, buffer: [u8; PAGE_SIZE]) -> Self {
-        Self { id, bytes: buffer }
-    }
-
-    fn get_id(&self) -> u64 {
-        self.id
-    }
-
-    fn get_page_bytes(&mut self) -> &mut [u8; PAGE_SIZE] {
-        &mut self.bytes
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexPage {
-    pub id: u64,
-    pub bytes: [u8; PAGE_SIZE],
-}
-
-impl IndexPage {}
-
-impl Page for IndexPage {
-    fn new(id: u64, buffer: [u8; PAGE_SIZE]) -> Self {
-        Self { id, bytes: buffer }
-    }
-
-    fn get_id(&self) -> u64 {
-        self.id
-    }
-
-    fn get_page_bytes(&mut self) -> &mut [u8; PAGE_SIZE] {
-        &mut self.bytes
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyValOffset {
-    pub key: String,
-    pub val_offset: usize,
-    pub size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableIndexEntry {
-    pub key: String,
-    pub page_offset: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableIndex {
-    pub index: Vec<TableIndexEntry>,
-}
-
-impl TableIndex {
-    fn new() -> Self {
-        Self { index: Vec::new() }
-    }
-
-    pub fn search(&self, item: &String) -> IoResult<usize> {
-        let res = self
-            .index
-            .binary_search_by_key(item, |entry| entry.key.clone())
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-
-        Ok(res)
-    }
-
-    pub fn get_offset(&self, index: usize) -> usize {
-        let entry = &self.index[index];
-        entry.page_offset
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableMetadata {
-    pub index_size: u64,
-    pub bitmap_size: u64,
-    pub filter_keys: [u64; 4],
-}
-
-impl TableMetadata {
-    fn new() -> Self {
-        Self {
-            index_size: 0,
-            bitmap_size: 0,
-            filter_keys: [0, 0, 0, 0],
-        }
-    }
-}
 
 // SortedStoreTable file structure -
 //------------START----------------
@@ -127,17 +29,17 @@ impl TableMetadata {
 
 #[derive(Debug)]
 pub struct SortedStoreTable {
-    table_pager: Pager<SortedStorePage>,
-    index: TableIndex,
-    metadata: TableMetadata,
+    table_pager: Pager<types::SortedStorePage>,
+    index: types::TableIndex,
+    metadata: types::TableMetadata,
     filter: BloomFilter<str>,
 }
 
 impl SortedStoreTable {
     fn new(path: &str) -> IoResult<Self> {
-        let table_pager = Pager::<SortedStorePage>::new(path)?;
-        let mut metadata = TableMetadata::new();
-        let index = TableIndex::new();
+        let table_pager = Pager::<types::SortedStorePage>::new(path)?;
+        let mut metadata = types::TableMetadata::new();
+        let index = types::TableIndex::new();
         let filter = BloomFilter::<str>::new(SORTED_TABLE_FILTER_ITEM_COUNT, FILTER_FP_RATE);
 
         let bitmap = filter.get_bitmap();
@@ -175,11 +77,11 @@ impl SortedStoreTable {
     }
 
     fn new_load_from_disk(path: &str) -> IoResult<Self> {
-        let table_pager = Pager::<SortedStorePage>::new(path)?;
+        let table_pager = Pager::<types::SortedStorePage>::new(path)?;
 
         let mut metadata_buffer = [0 as u8; 48];
         table_pager.read_arbitrary_from_offset(0 as usize, &mut metadata_buffer)?;
-        let metadata = bincode::deserialize::<TableMetadata>(&metadata_buffer)
+        let metadata = bincode::deserialize::<types::TableMetadata>(&metadata_buffer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         let num_pages = (metadata.bitmap_size as f64 / PAGE_SIZE as f64).ceil() as usize;
@@ -212,7 +114,7 @@ impl SortedStoreTable {
             final_index_buff_vec.as_mut_slice(),
         )?;
 
-        let index = bincode::deserialize::<TableIndex>(final_index_buff_vec.as_slice())
+        let index = bincode::deserialize::<types::TableIndex>(final_index_buff_vec.as_slice())
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         Ok(Self {
@@ -241,7 +143,7 @@ impl SortedStoreTable {
         self.table_pager
             .read_arbitrary_from_offset(offset, &mut page_buff)?;
 
-        let data = bincode::deserialize::<Vec<KeyValOffset>>(&page_buff)
+        let data = bincode::deserialize::<Vec<types::KeyValOffset>>(&page_buff)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         let idx = data
@@ -253,12 +155,12 @@ impl SortedStoreTable {
     }
 
     fn set_a_single_val(&mut self) -> IoResult<()> {
-        let index_item = TableIndexEntry {
+        let index_item = types::TableIndexEntry {
             key: "item".to_string(),
             page_offset: 48 + self.metadata.bitmap_size as usize,
         };
 
-        let item = vec![KeyValOffset {
+        let item = vec![types::KeyValOffset {
             key: "item".to_string(),
             val_offset: 4591,
             size: 800,
@@ -301,42 +203,6 @@ impl SortedStoreTable {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BucketMetadata {
-    pub index_size: u64,
-    pub children_data_size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChildBucket {
-    Child(String),
-    Null,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChildrenBuckets {
-    pub children: Vec<ChildBucket>,
-}
-
-impl ChildrenBuckets {
-    fn new() -> Self {
-        Self {
-            children: Vec::with_capacity(BUCKET_CHILDREN),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BucketIndexEntry {
-    pub key: String,
-    pub sorted_table_file: String,
-}
-
-#[derive(Debug)]
-pub struct BucketIndex {
-    pub index: Vec<BucketIndexEntry>,
-}
-
 // bucket metadata file structure -
 // ..............START..................
 // [metadata_block]
@@ -352,19 +218,19 @@ pub struct BucketIndex {
 
 #[derive(Debug)]
 pub struct Bucket {
-    pub bucket_pager: Pager<IndexPage>,
-    pub index: BucketIndex,
-    pub metadata: BucketMetadata,
-    pub children: ChildrenBuckets,
+    pub bucket_pager: Pager<types::IndexPage>,
+    pub index: types::BucketIndex,
+    pub metadata: types::BucketMetadata,
+    pub children: types::ChildrenBuckets,
 }
 
 impl Bucket {
     fn new(path: &str) -> IoResult<Self> {
-        let mut bucket_pager = Pager::<IndexPage>::new(path)?;
+        let mut bucket_pager = Pager::<types::IndexPage>::new(path)?;
         let mut metadata_buffer = [0 as u8; 16];
         bucket_pager.read_arbitrary_from_offset(0 as usize, &mut metadata_buffer)?;
 
-        let metadata = bincode::deserialize::<BucketMetadata>(&metadata_buffer)
+        let metadata = bincode::deserialize::<types::BucketMetadata>(&metadata_buffer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         let num_pages_children =
@@ -378,10 +244,10 @@ impl Bucket {
 
         bucket_pager.read_arbitrary_from_offset(16, children_buff.as_mut_slice())?;
 
-        let children = bincode::deserialize::<ChildrenBuckets>(children_buff.as_slice())
+        let children = bincode::deserialize::<types::ChildrenBuckets>(children_buff.as_slice())
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-        let index = bucket_pager.read_pages::<BucketIndexEntry>(
+        let index = bucket_pager.read_pages::<types::BucketIndexEntry>(
             0,
             16 + metadata.children_data_size as usize,
             metadata.index_size as usize,
@@ -390,7 +256,7 @@ impl Bucket {
         Ok(Self {
             bucket_pager,
             metadata,
-            index: BucketIndex { index },
+            index: types::BucketIndex { index },
             children: children,
         })
     }
@@ -400,9 +266,9 @@ mod test {
 
     use crate::storage::{
         pager::Pager,
-        sorted_store::{
-            Bucket, BucketIndexEntry, BucketMetadata, ChildBucket, ChildrenBuckets, IndexPage,
-            SortedStoreTable,
+        sorted_store::{Bucket, SortedStoreTable},
+        storage_types::{
+            BucketIndexEntry, BucketMetadata, ChildBucket, ChildrenBuckets, IndexPage,
         },
     };
     use bincode;

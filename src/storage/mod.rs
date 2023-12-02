@@ -6,3 +6,4 @@ mod pager;
 mod skiplist;
 mod sorted_store;
 mod storage_interface;
+mod storage_types;

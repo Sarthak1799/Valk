@@ -1,5 +1,5 @@
 use crate::constants::PAGE_SIZE;
-use crate::storage::{engine::IoResult, log_manager::ValueLog, storage_interface::Page};
+use crate::storage::{engine::IoResult, storage_interface::Page};
 use bincode;
 use serde::Serialize;
 use std::cmp::min;
@@ -252,8 +252,8 @@ fn deserialize_into_vectored_type<'de, T: serde::Deserialize<'de>>(
 #[cfg(test)]
 mod test {
     use crate::storage::{
-        log_manager::{LogPage, RecordType, ValueLog, ValueType},
         pager::Pager,
+        storage_types::{LogPage, RecordType, ValueLog, ValueType},
     };
     use std::{fs, iter::zip};
 
