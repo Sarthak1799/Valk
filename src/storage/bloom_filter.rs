@@ -116,7 +116,7 @@ impl<T: ?Sized> BloomFilter<T> {
         Ok(())
     }
 
-    pub fn get(&mut self, item: &T) -> IoResult<bool>
+    pub fn get(&self, item: &T) -> IoResult<bool>
     where
         T: Serialize,
     {

@@ -1,8 +1,49 @@
-use super::{engine::IoResult, pager::Pager, storage_interface::Storage, storage_types as types};
+use super::{
+    engine::IoResult,
+    pager::Pager,
+    storage_interface::{Compaction, Storage},
+    storage_types as types,
+};
+use siphasher::sip128::SipHasher24;
 use std::{
     io,
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+pub struct VLogController<'b> {
+    pub path: &'b str,
+    pub current: VLogManager<'b>,
+}
+
+impl<'b> VLogController<'b> {
+    fn new(path: &'b str) -> IoResult<Self> {
+        let current = VLogManager::new(path)?;
+        Ok(Self { path, current })
+    }
+
+    pub fn get_current_size(&self) -> u64 {
+        self.current.get_size()
+    }
+
+    pub fn append_log(&mut self, log: types::ValueLog) -> IoResult<()> {
+        self.current.append_log(log)
+    }
+
+    pub fn get(&self, key: String) -> IoResult<types::ValueLog> {
+        self.current.get(key)
+    }
+
+    pub fn get_compaction_inputs(&mut self, hasher: SipHasher24) -> IoResult<types::InputBuffer> {
+        let mut current_manager = &mut self.current;
+        let new_manager = VLogManager::new(self.path)?;
+
+        let inputs = current_manager.get_compaction_inputs(hasher)?;
+        self.current = new_manager;
+
+        Ok(inputs)
+    }
+}
 
 #[derive(Debug)]
 pub struct VLogManager<'b> {
@@ -11,6 +52,7 @@ pub struct VLogManager<'b> {
     pub metadata: types::VLogMetadata,
     pub entries: Arc<RwLock<types::LogArray>>,
     pub map: Arc<RwLock<types::LogBufferMap>>,
+    pub current_size: u64,
 }
 
 impl<'b> VLogManager<'b> {
@@ -34,15 +76,21 @@ impl<'b> VLogManager<'b> {
             metadata,
             entries,
             map,
+            current_size: 0,
         })
     }
 
     fn append_log(&mut self, log: types::ValueLog) -> IoResult<()> {
         let (page_id, val_offset, val_size) = self.pager.append_to_page(&log)?;
-        let header = types::LogHeader::new(page_id, val_offset, val_size);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
+            .as_nanos();
+
+        let header = types::LogHeader::new(page_id, val_offset, val_size, timestamp);
 
         let key = log.key.clone();
-        let vlog_entry = types::VLogEntry::new(log, header);
+        let vlog_entry = Arc::new(types::VLogEntry::new(log, header));
 
         let mut writer = self
             .entries
@@ -62,7 +110,7 @@ impl<'b> VLogManager<'b> {
             "Unable to retrive".to_string(),
         ))?;
 
-        let log_ref = entry.log.clone();
+        let log_ref = entry.clone();
 
         let mut map_writer = self
             .map
@@ -72,6 +120,7 @@ impl<'b> VLogManager<'b> {
         map_writer.store(Some(key), log_ref)?;
 
         self.metadata.head_offset = val_offset + val_size;
+        self.current_size += val_size as u64;
 
         Ok(())
     }
@@ -90,10 +139,10 @@ impl<'b> VLogManager<'b> {
             ))?
             .clone();
 
-        Ok(res.as_ref().clone())
+        Ok(res.log.clone())
     }
 
-    fn flush_log(&mut self) -> IoResult<()> {
+    pub fn flush_log(&mut self) -> IoResult<()> {
         let offset = self.metadata.tail_offset;
 
         let metadata = &self.metadata;
@@ -108,14 +157,18 @@ impl<'b> VLogManager<'b> {
 
         Ok(())
     }
+
+    pub fn get_size(&self) -> u64 {
+        self.current_size
+    }
 }
 
 #[cfg(test)]
 mod test {
 
     use super::{
-        types::LogPage, types::RecordType, types::VLogMetadata, types::ValueLog, types::ValueType,
-        Pager, VLogManager,
+        types::ChildrenBuckets, types::LogPage, types::RecordType, types::VLogMetadata,
+        types::ValueLog, types::ValueType, Pager, VLogManager,
     };
     use std::{fs, iter::zip};
 
