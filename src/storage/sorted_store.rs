@@ -1,19 +1,27 @@
 use super::{
-    bloom_filter::BloomFilter, engine::IoResult, pager::Pager, storage_interface::Page,
+    bloom_filter::BloomFilter,
+    engine::{GenericFindResult, IoResult},
+    pager::Pager,
+    storage_interface::{Compaction, CompactionPreprocessing},
     storage_types as types,
 };
 use crate::constants::{
-    COMPACTION_BUFFER_LOOP_COUNT, DUMMY_SORTED_TABLE_DATA_SIZE, DUMMY_SORTED_TABLE_FILE_SIZE,
-    FILTER_FP_RATE, PAGE_SIZE, SORTED_STORE_BUFFER_PAGE_COUNT, SORTED_TABLE_FILTER_ITEM_COUNT,
+    COMPACTION_BUFFER_LOOP_COUNT, DUMMY_SORTED_BUCKET_DATA_SIZE, DUMMY_SORTED_TABLE_DATA_SIZE,
+    DUMMY_SORTED_TABLE_FILE_SIZE, FILTER_FP_RATE, PAGE_SIZE, SORTED_STORE_BUFFER_PAGE_COUNT,
+    SORTED_TABLE_FILTER_ITEM_COUNT,
 };
 use bincode;
+use rayon;
 use siphasher::sip128::SipHasher24;
 use std::{
     cmp::min,
     collections::{BinaryHeap, HashMap},
     fs, io,
-    rc::Rc,
-    sync::{Arc, RwLock},
+    iter::zip,
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, RwLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -63,7 +71,7 @@ impl SortedStoreTable {
         Ok(table)
     }
 
-    fn new_load_from_disk(path: &str) -> IoResult<Self> {
+    pub fn new_load_from_disk(path: &str) -> IoResult<Self> {
         let table_pager = Pager::<types::SortedStorePage>::new(path)?;
 
         let mut metadata_buffer = [0 as u8; 56];
@@ -111,6 +119,10 @@ impl SortedStoreTable {
             metadata,
             filter,
         })
+    }
+
+    pub fn get_data_size(&self) -> u64 {
+        self.metadata.data_size
     }
 
     fn save_state(&mut self, final_buff: Vec<u8>) -> IoResult<()> {
@@ -222,34 +234,40 @@ impl SortedStoreTable {
         Ok(Vec::new())
     }
 
-    pub fn get_val_offset(&self, item: String) -> IoResult<types::KeyValOffset> {
-        let contains = &self.filter.get(item.as_str())?;
+    pub fn get_val_offset(&self, item: String) -> GenericFindResult<types::KeyValOffset> {
+        let contains = &self
+            .filter
+            .get(item.as_str())
+            .map_err(|err| types::GenericFindErrorKind::IoError(err.to_string()))?;
 
         if !contains {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "val not found".to_string(),
+            return Err(types::GenericFindErrorKind::NotFound(
+                "value not found".to_string(),
             ));
         }
 
-        let index = self.index.search(&item)?.ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "val not found".to_string(),
-        ))?;
+        let index = self
+            .index
+            .search(&item)
+            .ok_or(types::GenericFindErrorKind::NotFound(
+                "value not found".to_string(),
+            ))?;
 
         let offset = self.index.get_offset(index);
 
         let mut page_buff = Vec::with_capacity(PAGE_SIZE);
         unsafe { page_buff.set_len(PAGE_SIZE) }
         self.table_pager
-            .read_arbitrary_from_offset(offset, page_buff.as_mut_slice())?;
+            .read_arbitrary_from_offset(offset, page_buff.as_mut_slice())
+            .map_err(|err| types::GenericFindErrorKind::IoError(err.to_string()))?;
 
         let data = bincode::deserialize::<Vec<types::KeyValOffset>>(page_buff.as_slice())
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            .map_err(|err| types::GenericFindErrorKind::IoError(err.to_string()))?;
 
         let idx = data
             .binary_search_by_key(&item, |entry| entry.key.clone())
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            .map_err(|err| types::GenericFindErrorKind::NotFound("value not found".to_string()))?;
+
         let val = data[idx].clone();
 
         Ok(val)
@@ -269,7 +287,7 @@ impl SortedStoreTable {
         Ok(data[0].clone())
     }
 
-    pub fn get_compaction_buffer(&mut self, offset: usize) -> IoResult<Option<Vec<u8>>> {
+    pub fn get_compaction_buffer(&self, offset: usize) -> IoResult<Option<Vec<u8>>> {
         let fixed_offset = self.metadata.bitmap_size as usize + 56;
         let new_offset = offset + fixed_offset;
         let capacity = SORTED_STORE_BUFFER_PAGE_COUNT * PAGE_SIZE;
@@ -351,24 +369,113 @@ impl SortedStoreTable {
     }
 }
 
+#[derive(Debug)]
+pub struct BucketGlobalStateManager {
+    pub pager: Pager<types::IndexPage>,
+    pub metadata: types::BucketsControllerMetadata,
+    pub initialized_buckets: Vec<u128>,
+    pub curr_bucket_state: HashMap<u128, Arc<Bucket>>,
+    pub reciever: Receiver<types::BucketStateFetchRequest>,
+}
+
+impl BucketGlobalStateManager {
+    pub fn new(reciever: Receiver<types::BucketStateFetchRequest>) -> IoResult<Self> {
+        let pager = Pager::<types::IndexPage>::new("storage/buckets_state_manager.db")?;
+        let metadata = types::BucketsControllerMetadata::new();
+        let bytes = bincode::serialize(&metadata)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        pager.flush_arbitrary(0, bytes.as_slice())?;
+
+        Ok(Self {
+            pager,
+            metadata,
+            initialized_buckets: Vec::new(),
+            curr_bucket_state: HashMap::new(),
+            reciever,
+        })
+    }
+
+    pub fn new_load_from_disk(
+        reciever: Receiver<types::BucketStateFetchRequest>,
+    ) -> IoResult<Self> {
+        let pager = Pager::<types::IndexPage>::new("storage/buckets_state_manager.db")?;
+
+        let mut buff = [0 as u8; 8];
+
+        let metadata = bincode::deserialize::<types::BucketsControllerMetadata>(&mut buff)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let size = metadata.size;
+        let mut init_buff = Vec::with_capacity(size);
+        unsafe { init_buff.set_len(size) }
+
+        let initialized_buckets = bincode::deserialize::<Vec<u128>>(init_buff.as_mut_slice())
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        Ok(Self {
+            pager,
+            metadata,
+            initialized_buckets,
+            curr_bucket_state: HashMap::new(),
+            reciever,
+        })
+    }
+
+    pub fn serve_req(mut self) -> IoResult<()> {
+        while let Ok(req) = self.reciever.recv() {
+            let (find_key, lvl, file, other_sender) = (req.key, req.lvl, req.file, req.sender);
+
+            let maybe_bucket = self.curr_bucket_state.get(&find_key);
+
+            if let Some(bucket) = maybe_bucket {
+                other_sender
+                    .send((Some(bucket.clone()), false))
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            } else {
+                let present = self.initialized_buckets.iter().any(|key| key == &find_key);
+
+                let bucket = if present {
+                    let buck = Bucket::new_load_from_disk(file.as_str())?;
+                    let ret = Arc::new(buck);
+                    self.curr_bucket_state.insert(find_key, ret.clone());
+                    ret
+                } else {
+                    let buck = Bucket::new(file.as_str(), lvl, find_key)?;
+                    let ret = Arc::new(buck);
+                    self.curr_bucket_state.insert(find_key, ret.clone());
+                    self.initialized_buckets.push(find_key);
+                    ret
+                };
+
+                other_sender
+                    .send((Some(bucket.clone()), present))
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BucketsController {
-    pub buckets: HashMap<u128, Rc<Bucket>>,
+    pub state_sender: Sender<types::BucketStateFetchRequest>,
 }
 
 impl BucketsController {
-    fn new() -> Self {
+    pub fn new(sender: Sender<types::BucketStateFetchRequest>) -> Self {
         Self {
-            buckets: HashMap::new(),
+            state_sender: sender,
         }
     }
 
     pub fn get_children_buckets(
-        &mut self,
+        &self,
         hash: u128,
-        lvl: u16,
-        config: types::Config,
-    ) -> IoResult<Vec<Rc<Bucket>>> {
-        let new_lvl = lvl + 1;
+        lvl: i32,
+        config: &types::EngineConfig,
+    ) -> IoResult<Vec<Arc<Bucket>>> {
+        let new_lvl = (lvl + 1) as u32;
         let mut children_hashes = Vec::new();
         let mut buckets = Vec::new();
 
@@ -378,55 +485,141 @@ impl BucketsController {
         }
 
         for key in children_hashes {
-            let contains = self.buckets.get(&key);
-            if let Some(b) = contains {
-                buckets.push(b.clone());
-            } else {
-                let b = self.get_bucket(&config, key)?;
-                buckets.push(b);
-            }
+            let (bucket, _present) = self.get_bucket(config, key, new_lvl as u16)?;
+            buckets.push(bucket);
         }
 
         Ok(buckets)
     }
 
-    fn get_bucket(&mut self, config: &types::Config, bucket_key: u128) -> IoResult<Rc<Bucket>> {
-        let file = config.bucket_files.get(&bucket_key).ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "Bucket file not found in config".to_string(),
-        ))?;
-
-        let bucket = Bucket::new_load_from_disk(file.as_str())?;
-        self.buckets.insert(bucket_key, Rc::new(bucket));
-
-        let bucket = self
-            .buckets
+    fn get_bucket(
+        &self,
+        config: &types::EngineConfig,
+        bucket_key: u128,
+        lvl: u16,
+    ) -> IoResult<(Arc<Bucket>, bool)> {
+        let file = config
+            .bucket_files
             .get(&bucket_key)
             .ok_or(io::Error::new(
                 io::ErrorKind::Other,
-                "Bucket not found".to_string(),
+                "Bucket file not found in config".to_string(),
             ))?
             .clone();
 
-        Ok(bucket)
+        let (curr_sender, curr_reciever) = mpsc::channel();
+        let contain_req =
+            types::BucketStateFetchRequest::new_fetch_req(bucket_key, file, lvl, curr_sender);
+
+        self.state_sender
+            .send(contain_req)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let (bucket, present) = curr_reciever
+            .recv()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let bucket = bucket.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "failed to fetch bucket".to_string(),
+        ))?;
+
+        Ok((bucket, present))
     }
 
-    pub fn get(
-        &mut self,
-        key: String,
-        hasher: SipHasher24,
-        config: &types::Config,
-    ) -> IoResult<types::KeyValOffset> {
+    pub fn get(&self, key: String, config: &types::EngineConfig) -> IoResult<types::KeyValOffset> {
+        let mut curr_lvl = 0;
+        let mut bucket_key = 0;
+        let hasher = &config.hasher;
         let hashed = hasher.hash(key.as_bytes()).as_u128();
-        let bucket_key = hashed & 15;
-        let contains = self.buckets.get(&bucket_key);
 
-        if let Some(bucket) = contains {
-            bucket.get(key)
-        } else {
-            let bucket = self.get_bucket(config, bucket_key)?;
-            bucket.get(key)
+        loop {
+            let lvl_hash = (hashed >> (curr_lvl * 4)) & 15;
+            bucket_key = bucket_key | (lvl_hash << (curr_lvl * 4));
+
+            let (bucket, present) = self.get_bucket(config, bucket_key, curr_lvl)?;
+            if !present {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Value not found".to_string(),
+                ));
+            }
+
+            let res = bucket.get(key.clone());
+            curr_lvl += 1;
+
+            match res {
+                Ok(val) => return Ok(val),
+                Err(types::GenericFindErrorKind::IoError(e)) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e))
+                }
+                Err(types::GenericFindErrorKind::Other(e)) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e))
+                }
+                Err(types::GenericFindErrorKind::NotFound(_e)) => continue,
+            }
         }
+    }
+
+    pub fn trigger_compaction(
+        &self,
+        input_buffer: types::InputBuffer,
+        config: types::EngineConfig,
+    ) -> IoResult<()> {
+        let hasher = config.hasher.clone();
+        let buckets = self.get_children_buckets(0, -1, &config)?;
+
+        let (sender, receiver) = mpsc::channel();
+
+        for (bucket, buff) in zip(buckets, input_buffer.buffers) {
+            let pass = sender.clone();
+
+            rayon::spawn(move || {
+                let _res = compaction_perform_merge(bucket, buff, pass)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()));
+            })
+        }
+
+        while let Ok(res) = receiver.recv() {
+            match res.result {
+                Ok(_) => {
+                    let bucket = res.bucket.clone();
+                    let size = bucket.get_size()?;
+
+                    if size > DUMMY_SORTED_BUCKET_DATA_SIZE {
+                        let pass = sender.clone();
+
+                        let metadata = bucket.metadata.clone();
+                        let reader = metadata
+                            .read()
+                            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                        let bucket_meta = reader.get_metadata();
+                        let children = self.get_children_buckets(
+                            bucket_meta.hash,
+                            bucket_meta.lvl as i32,
+                            &config,
+                        )?;
+
+                        rayon::spawn(move || {
+                            let _res =
+                                bucket
+                                    .trigger_compaction(hasher, children, pass)
+                                    .map_err(|err| {
+                                        io::Error::new(io::ErrorKind::Other, err.to_string())
+                                    });
+                        })
+                    }
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Compaction failed with error - {:?}", e),
+                    ))
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -445,8 +638,8 @@ impl BucketsController {
 #[derive(Debug)]
 pub struct Bucket {
     pub bucket_pager: Pager<types::IndexPage>,
-    pub index: types::BucketIndex,
-    pub metadata: types::BucketMetadata,
+    pub index: Arc<RwLock<types::BucketIndex>>,
+    pub metadata: Arc<RwLock<types::BucketMetadata>>,
     //pub children: types::ChildrenBuckets,
     pub compaction_flag: Arc<RwLock<types::CompactionFlag>>,
 }
@@ -454,11 +647,11 @@ pub struct Bucket {
 impl Bucket {
     fn new(path: &str, lvl: u16, hash: u128) -> IoResult<Self> {
         let bucket_pager = Pager::<types::IndexPage>::new(path)?;
-        let index = types::BucketIndex::new();
-        let metadata = types::BucketMetadata::new(lvl, hash);
+        let index = Arc::new(RwLock::new(types::BucketIndex::new()));
+        let metadata = Arc::new(RwLock::new(types::BucketMetadata::new(lvl, hash)));
         // let children = types::ChildrenBuckets::new();
 
-        let mut bucket = Self {
+        let bucket = Self {
             bucket_pager,
             index,
             metadata,
@@ -502,25 +695,40 @@ impl Bucket {
 
         Ok(Self {
             bucket_pager,
-            metadata,
-            index: types::BucketIndex { index },
+            metadata: Arc::new(RwLock::new(metadata)),
+            index: Arc::new(RwLock::new(types::BucketIndex { index })),
             // children,
             compaction_flag: Arc::new(RwLock::new(types::CompactionFlag::new())),
         })
     }
 
-    fn save_state(&mut self) -> IoResult<()> {
-        let index_enc = bincode::serialize(&self.index.index)
+    fn save_state(&self) -> IoResult<()> {
+        let reader = self
+            .index
+            .read()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let index_enc = bincode::serialize(reader.get_index())
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        drop(reader);
 
         // let children_enc = bincode::serialize(&children)
         //     .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         // metadata.children_data_size = children_enc.as_slice().len() as u64;
-        self.metadata.index_size = index_enc.as_slice().len() as u64;
 
-        let meta_enc = bincode::serialize(&self.metadata)
+        let mut writer = self
+            .metadata
+            .write()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        writer.set_index_size(index_enc.as_slice().len() as u64);
+
+        let meta_enc = bincode::serialize(writer.get_metadata())
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        drop(writer);
 
         self.bucket_pager.flush_arbitrary(0, meta_enc.as_slice())?;
         self.bucket_pager
@@ -533,7 +741,7 @@ impl Bucket {
         Ok(())
     }
 
-    fn test_and_set_flag(&mut self) -> IoResult<bool> {
+    fn test_and_set_flag(&self) -> IoResult<bool> {
         let read_flag = self
             .compaction_flag
             .read()
@@ -552,7 +760,7 @@ impl Bucket {
         Ok(flag)
     }
 
-    fn unset_flag(&mut self) -> IoResult<()> {
+    fn unset_flag(&self) -> IoResult<()> {
         let mut write_flag = self
             .compaction_flag
             .write()
@@ -563,24 +771,30 @@ impl Bucket {
         Ok(())
     }
 
-    pub fn get(&self, key: String) -> IoResult<types::KeyValOffset> {
-        let file_idx = self.index.search(&key)?;
-        let idx = file_idx.ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "element not found".to_string(),
-        ))?;
+    pub fn get(&self, key: String) -> GenericFindResult<types::KeyValOffset> {
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| types::GenericFindErrorKind::Other(err.to_string()))?;
+
+        let idx = reader
+            .search(&key)
+            .ok_or(types::GenericFindErrorKind::NotFound(
+                "not found in bucket index".to_string(),
+            ))?;
 
         println!("nucket idx is - {}", idx);
-        let file = &self.index.index[idx];
+        let file = &reader.index[idx];
         println!("file is - {:?}", file);
-        let sst = SortedStoreTable::new_load_from_disk(&file.sorted_table_file)?;
+        let sst = SortedStoreTable::new_load_from_disk(&file.sorted_table_file)
+            .map_err(|err| types::GenericFindErrorKind::IoError(err.to_string()))?;
         //  println!("sst is - {:?}", sst);
 
         sst.get_val_offset(key)
     }
 
     pub fn get_compaction_tables_indices(
-        &mut self,
+        &self,
         input: &types::CompactionBuffer,
     ) -> IoResult<(Option<usize>, Option<usize>)> {
         let first = input.type_buffer.first().ok_or(io::Error::new(
@@ -593,8 +807,13 @@ impl Bucket {
             "element not found".to_string(),
         ))?;
 
-        let start_file = self.index.search(&first.key)?;
-        let end_file = self.index.search(&last.key)?;
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let start_file = reader.search(&first.key);
+        let end_file = reader.search(&last.key);
 
         Ok((start_file, end_file))
     }
@@ -619,8 +838,13 @@ impl Bucket {
             "Index not found in bucket".to_string(),
         ))?;
 
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
         for idx in frst..lst + 1 {
-            let file = &self.index.index[idx];
+            let file = &reader.index[idx];
             let sst = SortedStoreTable::new_load_from_disk(&file.sorted_table_file)?;
             sst_vec.push(sst);
         }
@@ -629,7 +853,7 @@ impl Bucket {
     }
 
     fn reset_index(
-        &mut self,
+        &self,
         indices: (Option<usize>, Option<usize>),
         sst_vec: Vec<(String, SortedStoreTable)>,
     ) -> IoResult<()> {
@@ -659,16 +883,21 @@ impl Bucket {
                 "element not found".to_string(),
             ))?;
 
-            for idx in 0..self.index.index.len() {
+            let reader = self
+                .index
+                .read()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+            for idx in 0..reader.index.len() {
                 if idx >= frst && idx <= lst {
                     continue;
                 }
-                new_tables.push(self.index.index[idx].clone());
+                new_tables.push(reader.index[idx].clone());
             }
 
             old_tables_for_deletion = (frst..lst + 1)
                 .into_iter()
-                .map(|ind| self.index.index[ind].sorted_table_file.clone())
+                .map(|ind| reader.index[ind].sorted_table_file.clone())
                 .collect::<Vec<_>>();
         }
 
@@ -676,8 +905,13 @@ impl Bucket {
 
         new_tables.sort();
 
-        let new_index = types::BucketIndex { index: new_tables };
-        self.index = new_index;
+        let mut writer = self
+            .index
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        writer.set_new_index(new_tables);
+        drop(writer);
 
         self.save_state()?;
 
@@ -689,7 +923,7 @@ impl Bucket {
     }
 
     fn write_to_tables(
-        &mut self,
+        &self,
         table_vec: &mut Vec<(String, SortedStoreTable)>,
         path_cnt: &mut i32,
         buffer: Vec<types::KeyValOffset>,
@@ -713,7 +947,73 @@ impl Bucket {
         Ok(())
     }
 
-    pub fn perform_merge(&mut self, input_buffer: types::CompactionBuffer) -> IoResult<()> {
+    pub fn get_size(&self) -> IoResult<usize> {
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let mut data_size = 0;
+        let _ = reader
+            .get_index()
+            .iter()
+            .map(|idx: &types::BucketIndexEntry| -> IoResult<()> {
+                let sst = SortedStoreTable::new_load_from_disk(&idx.sorted_table_file)?;
+                data_size += sst.get_data_size();
+                Ok(())
+            });
+
+        Ok(data_size as usize)
+    }
+
+    pub fn get_compaction_file_entry(&self) -> IoResult<types::BucketIndexEntry> {
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let mut data_size = 0;
+        let mut entry = types::BucketIndexEntry {
+            key: "dummy".to_string(),
+            sorted_table_file: "dummy".to_string(),
+        };
+
+        let _ = reader.index.iter().map(|idx| -> IoResult<()> {
+            let sst = SortedStoreTable::new_load_from_disk(&idx.sorted_table_file)?;
+            let curr_size = sst.get_data_size();
+            if curr_size > data_size {
+                data_size = curr_size;
+                entry = idx.clone();
+            }
+            Ok(())
+        });
+
+        Ok(entry)
+    }
+
+    pub fn trigger_compaction(
+        &self,
+        hasher: SipHasher24,
+        children: Vec<Arc<Bucket>>,
+        sender: Sender<types::BucketMergeResult>,
+    ) -> IoResult<()> {
+        let entry = self.get_compaction_file_entry()?;
+        let input_buffer = self.form_input_buffers(hasher, Some(entry))?;
+
+        for (bucket, buff) in zip(children, input_buffer.buffers) {
+            let pass = sender.clone();
+
+            rayon::spawn(move || {
+                compaction_perform_merge(bucket, buff, pass)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+                    .ok();
+            })
+        }
+
+        Ok(())
+    }
+
+    pub fn perform_merge(&self, input_buffer: types::CompactionBuffer) -> IoResult<()> {
         let flag = self.test_and_set_flag()?;
         if flag {
             return Err(io::Error::new(
@@ -726,7 +1026,10 @@ impl Bucket {
         let mut path_cnt = 0;
 
         // to be replaced with a dynamic file generator
-        let path = format!("/home/sarthak17/Desktop/SomeSSTfile_{}", path_cnt);
+        let mut path = format!("/home/sarthak17/Desktop/SomeSSTfile_{}", path_cnt);
+        // if f {
+        //     path = format!("/home/sarthak17/Desktop/SomeSSTfile_1");
+        // }
 
         let curr_table = SortedStoreTable::new(path.as_str())?;
 
@@ -801,6 +1104,19 @@ impl Bucket {
 
         Ok(())
     }
+}
+
+pub fn compaction_perform_merge(
+    bucket: Arc<Bucket>,
+    input_buffer: types::CompactionBuffer,
+    sender: Sender<types::BucketMergeResult>,
+) -> IoResult<()> {
+    let res = bucket.perform_merge(input_buffer);
+    let send_result = types::BucketMergeResult::new(bucket, res);
+    sender
+        .send(send_result)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    Ok(())
 }
 
 fn merge_two(
@@ -925,7 +1241,9 @@ mod test {
         //     .expect("Failed to flush");
 
         let bucket = Bucket::new_load_from_disk(path).expect("Failed");
-        let fl = &bucket.index.index[9];
+        let reader = bucket.index.read().expect("failed to get read lock");
+
+        let fl = &reader.index[9];
         let mut a = "".to_string();
 
         a = fl.sorted_table_file.clone();
@@ -998,7 +1316,7 @@ mod test {
             panic!("Failed to create the file: {}", err);
         }
 
-        let mut bucket = Bucket::new(path, 0, 0).expect("failed");
+        let bucket = Bucket::new(path, 0, 0).expect("failed");
 
         let timestamp1 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1054,7 +1372,17 @@ mod test {
         let one = bucket.get("item1".to_string()).expect("failed to get");
         let two = bucket.get("item3".to_string()).expect("failed to get");
 
+        println!("vals are - {:?} {:?}", one, two);
+
         let timestamp4 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("operation failed")
+            .as_nanos();
+        let timestamp5 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("operation failed")
+            .as_nanos();
+        let timestamp6 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("operation failed")
             .as_nanos();
@@ -1068,12 +1396,39 @@ mod test {
             },
             rec_type: RecordType::Delete,
         };
+        let item5 = KeyValOffset {
+            key: "item4".to_string(),
+            header: LogHeader {
+                page_id: 0,
+                offset: 4591,
+                size: 800,
+                timestamp: timestamp5,
+            },
+            rec_type: RecordType::AppendOrUpdate,
+        };
+        let item6 = KeyValOffset {
+            key: "item5".to_string(),
+            header: LogHeader {
+                page_id: 0,
+                offset: 4591,
+                size: 800,
+                timestamp: timestamp6,
+            },
+            rec_type: RecordType::AppendOrUpdate,
+        };
 
         let mut new_buffer = CompactionBuffer::new();
         new_buffer.insert(item4);
+        new_buffer.insert(item5);
+        new_buffer.insert(item6);
 
         bucket.perform_merge(new_buffer).expect("failed to compact");
-        let _val = bucket.get("item3".to_string()).expect("failed to get");
+        let val1 = bucket.get("item4".to_string()).expect("failed to get");
+        let val2 = bucket.get("item5".to_string()).expect("failed to get");
+
+        println!("vals are - {:?} {:?}", val1, val2);
+
+        let _val3 = bucket.get("item3".to_string()).expect("failed to get");
 
         fs::remove_file(path).unwrap();
     }

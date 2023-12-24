@@ -11,13 +11,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug)]
 pub struct VLogController<'b> {
     pub path: &'b str,
     pub current: VLogManager<'b>,
 }
 
 impl<'b> VLogController<'b> {
-    fn new(path: &'b str) -> IoResult<Self> {
+    pub fn new(path: &'b str) -> IoResult<Self> {
         let current = VLogManager::new(path)?;
         Ok(Self { path, current })
     }
@@ -30,15 +31,22 @@ impl<'b> VLogController<'b> {
         self.current.append_log(log)
     }
 
+    pub fn get_val_from_log<T>(&mut self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
+    where
+        for<'a> T: serde::de::Deserialize<'a>,
+    {
+        self.current.get_val_from_log(kval)
+    }
+
     pub fn get(&self, key: String) -> IoResult<types::ValueLog> {
         self.current.get(key)
     }
 
     pub fn get_compaction_inputs(&mut self, hasher: SipHasher24) -> IoResult<types::InputBuffer> {
-        let mut current_manager = &mut self.current;
-        let new_manager = VLogManager::new(self.path)?;
-
+        let current_manager = &mut self.current;
         let inputs = current_manager.get_compaction_inputs(hasher)?;
+
+        let new_manager = VLogManager::new(self.path)?;
         self.current = new_manager;
 
         Ok(inputs)
@@ -156,6 +164,14 @@ impl<'b> VLogManager<'b> {
         self.metadata.tail_offset = self.metadata.head_offset;
 
         Ok(())
+    }
+
+    pub fn get_val_from_log<T>(&mut self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
+    where
+        for<'a> T: serde::de::Deserialize<'a>,
+    {
+        let (page_id, offset, size) = (kval.header.page_id, kval.header.offset, kval.header.size);
+        self.pager.read_pages::<T>(page_id, offset, size)
     }
 
     pub fn get_size(&self) -> u64 {

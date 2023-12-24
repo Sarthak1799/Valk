@@ -1,10 +1,11 @@
-use super::{engine::IoResult, storage_interface::KWayMerge};
+use super::{engine::IoResult, sorted_store::Bucket};
 use crate::constants::{BUCKET_CHILDREN, PAGE_SIZE};
+use fastrand as random;
 use serde::{Deserialize, Serialize};
+use siphasher::sip128::SipHasher24;
 use std::{
     collections::{BTreeMap, HashMap},
-    io,
-    sync::Arc,
+    sync::{mpsc, Arc},
 };
 
 // ----------------------Log Types--------------------------
@@ -191,21 +192,21 @@ impl TableIndex {
         self.index.sort();
     }
 
-    pub fn search(&self, item: &String) -> IoResult<Option<usize>> {
+    pub fn search(&self, item: &String) -> Option<usize> {
         if self.index.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let res = self
             .index
             .binary_search_by_key(item, |entry| entry.key.clone());
         match res {
-            Ok(idx) => Ok(Some(idx)),
+            Ok(idx) => Some(idx),
             Err(idx) => {
                 if idx >= self.index.len() {
-                    Ok(Some(idx - 1))
+                    Some(idx - 1)
                 } else {
-                    Ok(Some(idx))
+                    Some(idx)
                 }
             }
         }
@@ -269,6 +270,14 @@ impl BucketMetadata {
             // children_data_size: 0,
         }
     }
+
+    pub fn set_index_size(&mut self, size: u64) {
+        self.index_size = size;
+    }
+
+    pub fn get_metadata(&self) -> &Self {
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,21 +327,21 @@ impl BucketIndex {
         Self { index: Vec::new() }
     }
 
-    pub fn search(&self, item: &String) -> IoResult<Option<usize>> {
+    pub fn search(&self, item: &String) -> Option<usize> {
         if self.index.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let res = self
             .index
             .binary_search_by_key(item, |entry| entry.key.clone());
         match res {
-            Ok(idx) => Ok(Some(idx)),
+            Ok(idx) => Some(idx),
             Err(idx) => {
                 if idx >= self.index.len() {
-                    Ok(Some(idx - 1))
+                    Some(idx - 1)
                 } else {
-                    Ok(Some(idx))
+                    Some(idx)
                 }
             }
         }
@@ -340,6 +349,49 @@ impl BucketIndex {
 
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    pub fn set_new_index(&mut self, index: Vec<BucketIndexEntry>) {
+        self.index = index;
+    }
+
+    pub fn get_index(&self) -> &Vec<BucketIndexEntry> {
+        &self.index
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketsControllerMetadata {
+    pub size: usize,
+}
+
+impl BucketsControllerMetadata {
+    pub fn new() -> Self {
+        Self { size: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketStateFetchRequest {
+    pub key: u128,
+    pub file: String,
+    pub lvl: u16,
+    pub sender: mpsc::Sender<(Option<Arc<Bucket>>, bool)>,
+}
+
+impl BucketStateFetchRequest {
+    pub fn new_fetch_req(
+        key: u128,
+        file: String,
+        lvl: u16,
+        sender: mpsc::Sender<(Option<Arc<Bucket>>, bool)>,
+    ) -> Self {
+        Self {
+            key,
+            file,
+            lvl,
+            sender,
+        }
     }
 }
 
@@ -375,7 +427,7 @@ impl CompactionBuffer {
 }
 
 pub struct InputBuffer {
-    buffers: Vec<CompactionBuffer>,
+    pub buffers: Vec<CompactionBuffer>,
 }
 
 impl InputBuffer {
@@ -426,6 +478,54 @@ impl CompactionFlag {
     }
 }
 
-pub struct Config {
+#[derive(Debug)]
+pub struct BucketMergeResult {
+    pub bucket: Arc<Bucket>,
+    pub result: IoResult<()>,
+}
+
+impl BucketMergeResult {
+    pub fn new(bucket: Arc<Bucket>, result: IoResult<()>) -> Self {
+        Self { bucket, result }
+    }
+}
+
+#[derive(Debug)]
+pub enum GenericFindErrorKind {
+    NotFound(String),
+    IoError(String),
+    Other(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
     pub bucket_files: HashMap<u128, String>,
+    pub hasher: SipHasher24,
+}
+
+impl EngineConfig {
+    pub fn new_from_data(vec: Vec<(u128, String)>, hash_keys: (u64, u64)) -> Self {
+        let map = HashMap::from_iter(vec);
+        let hasher = SipHasher24::new_with_keys(hash_keys.0, hash_keys.1);
+        Self {
+            bucket_files: map,
+            hasher,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineMetadata {
+    pub bucket_files_size: u64,
+    pub hash_keys: (u64, u64),
+}
+
+impl EngineMetadata {
+    fn new() -> Self {
+        let (key0, key1) = (random::u64(..1000000), random::u64(..1000000));
+        Self {
+            bucket_files_size: 0,
+            hash_keys: (key0, key1),
+        }
+    }
 }

@@ -1,8 +1,17 @@
 // All the interfaces used for storage purposes
-use super::{engine::IoResult, log_manager::VLogManager, storage_types as types};
+use super::{
+    engine::IoResult,
+    log_manager::VLogManager,
+    sorted_store::{Bucket, SortedStoreTable},
+    storage_types as types,
+};
 use crate::constants::PAGE_SIZE;
 use siphasher::sip128::SipHasher24;
-use std::{io, sync::Arc};
+use std::{
+    io,
+    rc::Rc,
+    sync::{Arc, RwLock},
+};
 
 pub trait Storage<K, V> {
     fn store(&mut self, key: Option<K>, value: V) -> IoResult<()>;
@@ -119,16 +128,29 @@ impl From<&types::VLogEntry> for types::KeyValOffset {
 // }
 
 pub trait CompactionPreprocessing {
-    type CompactionChildren;
-    fn form_input_buffers(&mut self, hasher: SipHasher24) -> IoResult<types::InputBuffer>;
+    type PreprocessingOutput;
+    type AuxilaryInput;
+    type HashObject;
 
-    fn perform_preprocessing(&mut self) -> IoResult<()>;
+    fn form_input_buffers(
+        &self,
+        hasher: Self::HashObject,
+        auxilary_input: Option<Self::AuxilaryInput>,
+    ) -> IoResult<types::InputBuffer>;
+
+    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput>;
 }
 
 impl<'b> CompactionPreprocessing for VLogManager<'b> {
-    type CompactionChildren = types::ChildrenBuckets;
+    type PreprocessingOutput = ();
+    type AuxilaryInput = ();
+    type HashObject = SipHasher24;
 
-    fn form_input_buffers(&mut self, hasher: SipHasher24) -> IoResult<types::InputBuffer> {
+    fn form_input_buffers(
+        &self,
+        hasher: Self::HashObject,
+        auxilary_input: Option<Self::AuxilaryInput>,
+    ) -> IoResult<types::InputBuffer> {
         let reader = self
             .map
             .read()
@@ -145,8 +167,55 @@ impl<'b> CompactionPreprocessing for VLogManager<'b> {
         Ok(input_buffer)
     }
 
-    fn perform_preprocessing(&mut self) -> IoResult<()> {
+    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput> {
         self.flush_log()
+    }
+}
+
+impl CompactionPreprocessing for Bucket {
+    type PreprocessingOutput = types::BucketIndexEntry;
+    type AuxilaryInput = types::BucketIndexEntry;
+    type HashObject = SipHasher24;
+
+    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput> {
+        let reader = self
+            .index
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let entry = reader.index[0].clone();
+        Ok(entry)
+    }
+
+    fn form_input_buffers(
+        &self,
+        hasher: <Self as CompactionPreprocessing>::HashObject,
+        sst_entry: Option<Self::AuxilaryInput>,
+    ) -> IoResult<types::InputBuffer> {
+        let entry = sst_entry.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "index entry not found".to_string(),
+        ))?;
+        let sst = SortedStoreTable::new_load_from_disk(&entry.sorted_table_file)?;
+        let mut input_buffer = types::InputBuffer::new();
+
+        while let Some(buff) = sst.get_compaction_buffer(0)? {
+            let mut merge_vec = Vec::new();
+
+            for buf in buff.chunks(PAGE_SIZE) {
+                let item = bincode::deserialize::<Vec<types::KeyValOffset>>(&buf)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+                merge_vec.extend(item);
+            }
+
+            let _ = merge_vec.into_iter().map(|kval| {
+                let key_hash = hasher.hash(kval.key.as_bytes()).as_u128();
+                input_buffer.append_to_child(kval, key_hash, 0);
+            });
+        }
+
+        Ok(input_buffer)
     }
 }
 
@@ -160,20 +229,33 @@ pub trait Compaction: CompactionPreprocessing {
 
     fn get_compaction_inputs(
         &mut self,
-        hasher: Self::HashObject,
+        hasher: <Self as CompactionPreprocessing>::HashObject,
     ) -> IoResult<Self::CompactionInput>;
 }
 
-impl<'b> Compaction for VLogManager<'b> {
+impl<'b, 'a> Compaction for VLogManager<'b> {
     type CompactionInput = types::InputBuffer;
     type HashObject = SipHasher24;
 
     fn get_compaction_inputs(
         &mut self,
-        hasher: Self::HashObject,
+        hasher: <Self as Compaction>::HashObject,
     ) -> IoResult<Self::CompactionInput> {
-        let input = self.form_input_buffers(hasher)?;
+        let input = self.form_input_buffers(hasher, None)?;
         self.perform_preprocessing()?;
         Ok(input)
+    }
+}
+
+impl Compaction for Bucket {
+    type CompactionInput = types::InputBuffer;
+    type HashObject = SipHasher24;
+
+    fn get_compaction_inputs(
+        &mut self,
+        hasher: <Self as Compaction>::HashObject,
+    ) -> IoResult<Self::CompactionInput> {
+        let entry = self.perform_preprocessing()?;
+        self.form_input_buffers(hasher, Some(entry))
     }
 }
