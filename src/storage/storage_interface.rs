@@ -2,6 +2,7 @@
 use super::{
     engine::IoResult,
     log_manager::VLogManager,
+    pager::Pager,
     sorted_store::{Bucket, SortedStoreTable},
     storage_types as types,
 };
@@ -129,6 +130,7 @@ impl From<&types::VLogEntry> for types::KeyValOffset {
 
 pub trait CompactionPreprocessing {
     type PreprocessingOutput;
+    type PreprocessingInput;
     type AuxilaryInput;
     type HashObject;
 
@@ -138,11 +140,18 @@ pub trait CompactionPreprocessing {
         auxilary_input: Option<Self::AuxilaryInput>,
     ) -> IoResult<types::InputBuffer>;
 
-    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput>;
+    fn perform_preprocessing(
+        &self,
+        preprocessing_input: Option<Self::PreprocessingInput>,
+    ) -> IoResult<Self::PreprocessingOutput>;
 }
 
-impl<'b> CompactionPreprocessing for VLogManager<'b> {
+impl CompactionPreprocessing for VLogManager {
     type PreprocessingOutput = ();
+    type PreprocessingInput = (
+        Arc<RwLock<Pager<types::LogPage>>>,
+        Arc<RwLock<types::VLogMetadata>>,
+    );
     type AuxilaryInput = ();
     type HashObject = SipHasher24;
 
@@ -167,17 +176,28 @@ impl<'b> CompactionPreprocessing for VLogManager<'b> {
         Ok(input_buffer)
     }
 
-    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput> {
-        self.flush_log()
+    fn perform_preprocessing(
+        &self,
+        input: Option<Self::PreprocessingInput>,
+    ) -> IoResult<Self::PreprocessingOutput> {
+        let (pager, metadata) = input.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "input err".to_string(),
+        ))?;
+        self.flush_log(pager, metadata)
     }
 }
 
 impl CompactionPreprocessing for Bucket {
     type PreprocessingOutput = types::BucketIndexEntry;
     type AuxilaryInput = types::BucketIndexEntry;
+    type PreprocessingInput = ();
     type HashObject = SipHasher24;
 
-    fn perform_preprocessing(&mut self) -> IoResult<Self::PreprocessingOutput> {
+    fn perform_preprocessing(
+        &self,
+        input: Option<Self::PreprocessingInput>,
+    ) -> IoResult<Self::PreprocessingOutput> {
         let reader = self
             .index
             .read()
@@ -226,23 +246,30 @@ pub trait KWayMerge {
 pub trait Compaction: CompactionPreprocessing {
     type CompactionInput;
     type HashObject;
+    type PreprocessingInput;
 
     fn get_compaction_inputs(
-        &mut self,
+        &self,
         hasher: <Self as CompactionPreprocessing>::HashObject,
+        pre_input: Option<<Self as Compaction>::PreprocessingInput>,
     ) -> IoResult<Self::CompactionInput>;
 }
 
-impl<'b, 'a> Compaction for VLogManager<'b> {
+impl<'a> Compaction for VLogManager {
     type CompactionInput = types::InputBuffer;
     type HashObject = SipHasher24;
+    type PreprocessingInput = (
+        Arc<RwLock<Pager<types::LogPage>>>,
+        Arc<RwLock<types::VLogMetadata>>,
+    );
 
     fn get_compaction_inputs(
-        &mut self,
+        &self,
         hasher: <Self as Compaction>::HashObject,
+        pre_input: Option<<Self as Compaction>::PreprocessingInput>,
     ) -> IoResult<Self::CompactionInput> {
         let input = self.form_input_buffers(hasher, None)?;
-        self.perform_preprocessing()?;
+        self.perform_preprocessing(pre_input)?;
         Ok(input)
     }
 }
@@ -250,12 +277,14 @@ impl<'b, 'a> Compaction for VLogManager<'b> {
 impl Compaction for Bucket {
     type CompactionInput = types::InputBuffer;
     type HashObject = SipHasher24;
+    type PreprocessingInput = ();
 
     fn get_compaction_inputs(
-        &mut self,
+        &self,
         hasher: <Self as Compaction>::HashObject,
+        pre_input: Option<<Self as Compaction>::PreprocessingInput>,
     ) -> IoResult<Self::CompactionInput> {
-        let entry = self.perform_preprocessing()?;
+        let entry = self.perform_preprocessing(pre_input)?;
         self.form_input_buffers(hasher, Some(entry))
     }
 }

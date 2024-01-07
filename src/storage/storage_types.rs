@@ -70,6 +70,29 @@ pub struct VLogMetadata {
     pub tail_offset: usize,
 }
 
+impl VLogMetadata {
+    pub fn new() -> Self {
+        Self {
+            head_offset: 0,
+            tail_offset: 0,
+        }
+    }
+    pub fn update_head_offset(&mut self, new_offset: usize) {
+        self.head_offset = new_offset;
+    }
+
+    pub fn update_tail_offset(&mut self, new_offset: usize) {
+        self.tail_offset = new_offset;
+    }
+
+    pub fn get_self_ref(&self) -> &Self {
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VLogSize(pub u64);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LogHeader {
     pub page_id: u64,
@@ -98,6 +121,10 @@ impl LogArray {
     pub fn new() -> Self {
         Self { arr: Vec::new() }
     }
+
+    pub fn clear(&mut self) {
+        self.arr.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +145,10 @@ impl LogBufferMap {
 
     pub fn get(&self, key: String) -> Option<&Arc<VLogEntry>> {
         self.map.get(&key)
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
     }
 }
 
@@ -456,11 +487,11 @@ impl InputBuffer {
 }
 
 #[derive(Debug)]
-pub struct CompactionFlag {
+pub struct GenericFlag {
     pub flag: bool,
 }
 
-impl CompactionFlag {
+impl GenericFlag {
     pub fn new() -> Self {
         Self { flag: false }
     }
@@ -475,6 +506,10 @@ impl CompactionFlag {
 
     pub fn unset(&mut self) {
         self.flag = false;
+    }
+
+    pub fn flip(&mut self) {
+        self.flag = !self.flag
     }
 }
 
@@ -521,7 +556,7 @@ pub struct EngineMetadata {
 }
 
 impl EngineMetadata {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let (key0, key1) = (random::u64(..1000000), random::u64(..1000000));
         Self {
             bucket_files_size: 0,

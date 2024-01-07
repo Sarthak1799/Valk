@@ -12,84 +12,184 @@ use std::{
 };
 
 #[derive(Debug)]
-pub struct VLogController<'b> {
-    pub path: &'b str,
-    pub current: VLogManager<'b>,
+pub struct VLogController {
+    pub path: &'static str,
+    pub pager: Arc<RwLock<Pager<types::LogPage>>>,
+    pub metadata: Arc<RwLock<types::VLogMetadata>>,
+    pub route_flag: Arc<RwLock<types::GenericFlag>>,
+    pub current: VLogManager,
+    pub next: VLogManager,
 }
 
-impl<'b> VLogController<'b> {
-    pub fn new(path: &'b str) -> IoResult<Self> {
-        let current = VLogManager::new(path)?;
-        Ok(Self { path, current })
+impl VLogController {
+    pub fn init(path: &'static str) -> IoResult<()> {
+        let pager = Pager::<types::LogPage>::new(path)?;
+        let metadata = types::VLogMetadata::new();
+
+        let enc = bincode::serialize(&metadata)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        pager.flush_arbitrary(0, enc.as_slice())?;
+
+        Ok(())
     }
-
-    pub fn get_current_size(&self) -> u64 {
-        self.current.get_size()
-    }
-
-    pub fn append_log(&mut self, log: types::ValueLog) -> IoResult<()> {
-        self.current.append_log(log)
-    }
-
-    pub fn get_val_from_log<T>(&mut self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
-    where
-        for<'a> T: serde::de::Deserialize<'a>,
-    {
-        self.current.get_val_from_log(kval)
-    }
-
-    pub fn get(&self, key: String) -> IoResult<types::ValueLog> {
-        self.current.get(key)
-    }
-
-    pub fn get_compaction_inputs(&mut self, hasher: SipHasher24) -> IoResult<types::InputBuffer> {
-        let current_manager = &mut self.current;
-        let inputs = current_manager.get_compaction_inputs(hasher)?;
-
-        let new_manager = VLogManager::new(self.path)?;
-        self.current = new_manager;
-
-        Ok(inputs)
-    }
-}
-
-#[derive(Debug)]
-pub struct VLogManager<'b> {
-    pub path: &'b str,
-    pub pager: Pager<types::LogPage>,
-    pub metadata: types::VLogMetadata,
-    pub entries: Arc<RwLock<types::LogArray>>,
-    pub map: Arc<RwLock<types::LogBufferMap>>,
-    pub current_size: u64,
-}
-
-impl<'b> VLogManager<'b> {
-    fn new(path: &'b str) -> IoResult<Self> {
+    pub fn new_load_from_disk(path: &'static str) -> IoResult<Self> {
         let mut buffer = [0 as u8; 16];
 
-        let mut pager = Pager::new(path)?;
+        let mut pager = Pager::<types::LogPage>::new(path)?;
         pager.read_arbitrary_from_offset(0, &mut buffer)?;
 
         let metadata = bincode::deserialize::<types::VLogMetadata>(&buffer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
         pager.set_page(metadata.head_offset)?;
-
-        let entries = Arc::new(RwLock::new(types::LogArray::new()));
-        let map = Arc::new(RwLock::new(types::LogBufferMap::new()));
-
+        let current = VLogManager::new();
+        let next = VLogManager::new();
         Ok(Self {
             path,
-            pager,
-            metadata,
-            entries,
-            map,
-            current_size: 0,
+            pager: Arc::new(RwLock::new(pager)),
+            metadata: Arc::new(RwLock::new(metadata)),
+            current,
+            next,
+            route_flag: Arc::new(RwLock::new(types::GenericFlag::new())),
         })
     }
 
-    fn append_log(&mut self, log: types::ValueLog) -> IoResult<()> {
-        let (page_id, val_offset, val_size) = self.pager.append_to_page(&log)?;
+    fn read_flag(&self) -> IoResult<bool> {
+        let reader = self
+            .route_flag
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        Ok(reader.check())
+    }
+
+    pub fn get_current_size(&self) -> IoResult<u64> {
+        let curr_val = self.read_flag()?;
+
+        if curr_val {
+            self.next.get_size()
+        } else {
+            self.current.get_size()
+        }
+    }
+
+    pub fn append_log(&self, log: types::ValueLog) -> IoResult<()> {
+        let pager = self.pager.clone();
+        let metadata = self.metadata.clone();
+        self.current.append_log(pager, metadata, log)
+    }
+
+    pub fn get_val_from_log<T>(&self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
+    where
+        for<'a> T: serde::de::Deserialize<'a>,
+    {
+        let pager = self.pager.clone();
+        self.current.get_val_from_log(kval, pager)
+    }
+
+    pub fn get(&self, key: String) -> IoResult<types::ValueLog> {
+        self.current.get(key)
+    }
+
+    pub fn flip_flag(&self) -> IoResult<()> {
+        let reader = self.route_flag.try_read();
+        let mut curr_val = false;
+
+        if let Err(_e) = reader {
+            return Ok(());
+        } else if let Ok(read) = reader {
+            curr_val = read.check();
+        }
+
+        let mut writer = self
+            .route_flag
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        if writer.check() != curr_val {
+            return Ok(());
+        } else {
+            writer.flip();
+        }
+
+        Ok(())
+    }
+
+    pub fn get_compaction_inputs(&self, hasher: SipHasher24) -> IoResult<types::InputBuffer> {
+        let curr_val = self.read_flag()?;
+        let pager = self.pager.clone();
+        let metadata = self.metadata.clone();
+
+        let inputs = if curr_val {
+            self.current
+                .get_compaction_inputs(hasher, Some((pager, metadata)))?
+        } else {
+            self.next
+                .get_compaction_inputs(hasher, Some((pager, metadata)))?
+        };
+
+        Ok(inputs)
+    }
+}
+
+#[derive(Debug)]
+pub struct VLogManager {
+    pub entries: Arc<RwLock<types::LogArray>>,
+    pub map: Arc<RwLock<types::LogBufferMap>>,
+    pub current_size: Arc<RwLock<types::VLogSize>>,
+}
+
+impl VLogManager {
+    fn new() -> Self {
+        let entries = Arc::new(RwLock::new(types::LogArray::new()));
+        let map = Arc::new(RwLock::new(types::LogBufferMap::new()));
+
+        Self {
+            entries,
+            map,
+            current_size: Arc::new(RwLock::new(types::VLogSize(0))),
+        }
+    }
+
+    pub fn clear(&self, pager: Arc<RwLock<Pager<types::LogPage>>>) -> IoResult<()> {
+        let mut page_writer = pager
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let mut vec_writer = self
+            .entries
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let mut map_writer = self
+            .map
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let mut size_writer = self
+            .current_size
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        page_writer.clear();
+        vec_writer.clear();
+        map_writer.clear();
+        size_writer.0 = 0;
+
+        Ok(())
+    }
+
+    fn append_log(
+        &self,
+        pager: Arc<RwLock<Pager<types::LogPage>>>,
+        metadata: Arc<RwLock<types::VLogMetadata>>,
+        log: types::ValueLog,
+    ) -> IoResult<()> {
+        let mut page_writer = pager
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let (page_id, val_offset, val_size) = page_writer.append_to_page(&log)?;
+        drop(page_writer);
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
@@ -127,8 +227,17 @@ impl<'b> VLogManager<'b> {
 
         map_writer.store(Some(key), log_ref)?;
 
-        self.metadata.head_offset = val_offset + val_size;
-        self.current_size += val_size as u64;
+        let mut metadata_writer = metadata
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        metadata_writer.update_head_offset(val_offset + val_size);
+        let mut curr_size_writer = self
+            .current_size
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        curr_size_writer.0 += val_size as u64;
 
         Ok(())
     }
@@ -150,63 +259,82 @@ impl<'b> VLogManager<'b> {
         Ok(res.log.clone())
     }
 
-    pub fn flush_log(&mut self) -> IoResult<()> {
-        let offset = self.metadata.tail_offset;
-
-        let metadata = &self.metadata;
-        let metadata_bytes = bincode::serialize(metadata)
+    pub fn flush_log(
+        &self,
+        pager: Arc<RwLock<Pager<types::LogPage>>>,
+        metadata: Arc<RwLock<types::VLogMetadata>>,
+    ) -> IoResult<()> {
+        let metadata_reader = metadata
+            .read()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-        self.pager.flush_arbitrary(0, metadata_bytes.as_slice())?;
-        self.pager.flush_pages(offset)?;
+        let tail = metadata_reader.tail_offset;
+        let head = metadata_reader.head_offset;
+        let meta = metadata_reader.get_self_ref();
+        let metadata_bytes = bincode::serialize(meta)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        drop(metadata_reader);
+
+        let mut page_writer = pager
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        page_writer.flush_arbitrary(0, metadata_bytes.as_slice())?;
+        page_writer.flush_pages(tail)?;
+
+        drop(page_writer);
 
         // assume operations to be successful for now due to absence of a recovery module
-        self.metadata.tail_offset = self.metadata.head_offset;
+        let mut metadata_writer = metadata
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        metadata_writer.update_tail_offset(head);
 
         Ok(())
     }
 
-    pub fn get_val_from_log<T>(&mut self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
+    pub fn get_val_from_log<T>(
+        &self,
+        kval: types::KeyValOffset,
+        pager: Arc<RwLock<Pager<types::LogPage>>>,
+    ) -> IoResult<Vec<T>>
     where
         for<'a> T: serde::de::Deserialize<'a>,
     {
         let (page_id, offset, size) = (kval.header.page_id, kval.header.offset, kval.header.size);
-        self.pager.read_pages::<T>(page_id, offset, size)
+        let mut page_writer = pager
+            .write()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        page_writer.read_pages::<T>(page_id, offset, size)
     }
 
-    pub fn get_size(&self) -> u64 {
-        self.current_size
+    pub fn get_size(&self) -> IoResult<u64> {
+        let reader = self
+            .current_size
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        Ok(reader.0)
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use super::{
-        types::ChildrenBuckets, types::LogPage, types::RecordType, types::VLogMetadata,
-        types::ValueLog, types::ValueType, Pager, VLogManager,
-    };
+    use crate::storage::log_manager::VLogController;
+
+    use super::{types::RecordType, types::ValueLog, types::ValueType};
     use std::{fs, iter::zip};
 
     #[test]
     fn log_manager_test() {
         let path = "/home/sarthak17/Desktop/disk_test";
 
-        let file_creation_result = fs::File::create(path);
-        if let Err(err) = file_creation_result {
-            panic!("Failed to create the file: {}", err);
-        }
-
-        let initial_metadata = VLogMetadata {
-            head_offset: 16,
-            tail_offset: 16,
-        };
-
-        let bytes = bincode::serialize(&initial_metadata).unwrap();
-        let disk = Pager::<LogPage>::new(path).expect("failed");
-        disk.flush_arbitrary(0, bytes.as_slice()).expect("failed");
-
-        let mut log_manager = VLogManager::new(path).expect("Failed to create VLogManager");
+        VLogController::init(path).expect("failed to init");
+        let controller = VLogController::new_load_from_disk(path).expect("failed");
 
         let key = "test_key".to_string();
         let bytes = [1, 2, 3];
@@ -217,9 +345,9 @@ mod test {
 
         let log = ValueLog::new(key.clone(), value.clone(), RecordType::AppendOrUpdate);
 
-        log_manager.append_log(log.clone()).expect("failed ok");
+        controller.append_log(log.clone()).expect("failed");
 
-        let val = log_manager.get(key).expect("Failed");
+        let val = controller.get(key).expect("Failed");
 
         assert_eq!(log, val);
 
@@ -230,21 +358,8 @@ mod test {
     fn log_manager_flush_test<'de>() {
         let path = "/home/sarthak17/Desktop/disk_test";
 
-        let file_creation_result = fs::File::create(path);
-        if let Err(err) = file_creation_result {
-            panic!("Failed to create the file: {}", err);
-        }
-
-        let initial_metadata = VLogMetadata {
-            head_offset: 16,
-            tail_offset: 16,
-        };
-
-        let bytes = bincode::serialize(&initial_metadata).unwrap();
-        let disk = Pager::<LogPage>::new(path).expect("failed");
-        disk.flush_arbitrary(0, bytes.as_slice()).expect("failed");
-
-        let mut log_manager = VLogManager::new(path).expect("Failed to create VLogManager");
+        VLogController::init(path).expect("failed to init");
+        let controller = VLogController::new_load_from_disk(path).expect("failed");
 
         let key = "test_key".to_string();
         let bytes = [1, 2, 3];
@@ -261,19 +376,21 @@ mod test {
         let log = ValueLog::new(key.clone(), value.clone(), RecordType::AppendOrUpdate);
         let log1 = ValueLog::new(key1.clone(), value1.clone(), RecordType::AppendOrUpdate);
 
-        log_manager.append_log(log.clone()).expect("failed ok");
-        log_manager.append_log(log1.clone()).expect("failed ok");
+        controller.append_log(log.clone()).expect("failed ok");
+        controller.append_log(log1.clone()).expect("failed ok");
 
-        log_manager.flush_log().expect("Failed to flush");
+        controller
+            .current
+            .flush_log(controller.pager.clone(), controller.metadata.clone())
+            .expect("Failed to flush");
 
         let mut initial_vec = Vec::new();
         initial_vec.push(log);
         initial_vec.push(log1);
 
-        let log_vec = log_manager
-            .pager
-            .read_pages::<ValueLog>(0, 16, 112)
-            .unwrap();
+        let mut page_mut = controller.pager.write().unwrap();
+
+        let log_vec = page_mut.read_pages::<ValueLog>(0, 16, 112).unwrap();
 
         for (l1, l2) in zip(initial_vec, log_vec) {
             assert_eq!(l1, l2);

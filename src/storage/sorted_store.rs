@@ -379,7 +379,7 @@ pub struct BucketGlobalStateManager {
 }
 
 impl BucketGlobalStateManager {
-    pub fn new(reciever: Receiver<types::BucketStateFetchRequest>) -> IoResult<Self> {
+    pub fn init() -> IoResult<()> {
         let pager = Pager::<types::IndexPage>::new("storage/buckets_state_manager.db")?;
         let metadata = types::BucketsControllerMetadata::new();
         let bytes = bincode::serialize(&metadata)
@@ -387,13 +387,7 @@ impl BucketGlobalStateManager {
 
         pager.flush_arbitrary(0, bytes.as_slice())?;
 
-        Ok(Self {
-            pager,
-            metadata,
-            initialized_buckets: Vec::new(),
-            curr_bucket_state: HashMap::new(),
-            reciever,
-        })
+        Ok(())
     }
 
     pub fn new_load_from_disk(
@@ -527,7 +521,7 @@ impl BucketsController {
         Ok((bucket, present))
     }
 
-    pub fn get(&self, key: String, config: &types::EngineConfig) -> IoResult<types::KeyValOffset> {
+    pub fn get(&self, key: String, config: types::EngineConfig) -> IoResult<types::KeyValOffset> {
         let mut curr_lvl = 0;
         let mut bucket_key = 0;
         let hasher = &config.hasher;
@@ -537,7 +531,7 @@ impl BucketsController {
             let lvl_hash = (hashed >> (curr_lvl * 4)) & 15;
             bucket_key = bucket_key | (lvl_hash << (curr_lvl * 4));
 
-            let (bucket, present) = self.get_bucket(config, bucket_key, curr_lvl)?;
+            let (bucket, present) = self.get_bucket(&config, bucket_key, curr_lvl)?;
             if !present {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -641,7 +635,7 @@ pub struct Bucket {
     pub index: Arc<RwLock<types::BucketIndex>>,
     pub metadata: Arc<RwLock<types::BucketMetadata>>,
     //pub children: types::ChildrenBuckets,
-    pub compaction_flag: Arc<RwLock<types::CompactionFlag>>,
+    pub compaction_flag: Arc<RwLock<types::GenericFlag>>,
 }
 
 impl Bucket {
@@ -656,7 +650,7 @@ impl Bucket {
             index,
             metadata,
             // children,
-            compaction_flag: Arc::new(RwLock::new(types::CompactionFlag::new())),
+            compaction_flag: Arc::new(RwLock::new(types::GenericFlag::new())),
         };
 
         bucket.save_state()?;
@@ -698,7 +692,7 @@ impl Bucket {
             metadata: Arc::new(RwLock::new(metadata)),
             index: Arc::new(RwLock::new(types::BucketIndex { index })),
             // children,
-            compaction_flag: Arc::new(RwLock::new(types::CompactionFlag::new())),
+            compaction_flag: Arc::new(RwLock::new(types::GenericFlag::new())),
         })
     }
 
