@@ -9,5 +9,6 @@ pub const DUMMY_SORTED_TABLE_FILE_SIZE: usize = 1024 * 1024;
 pub const DUMMY_SORTED_BUCKET_DATA_SIZE: usize = 1048576 * 1048576;
 pub const DUMMY_SORTED_TABLE_DATA_SIZE: usize = 1024 * 512;
 pub const COMPACTION_BUFFER_LOOP_COUNT: usize = 100;
+pub const GARBAGE_COLLECTION_DATA_SIZE: usize = 1024 * 1024;
 #[cfg(feature = "skiplist")]
 pub const SKIPLIST_MAX_LEVELS: i32 = 5;

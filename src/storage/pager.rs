@@ -65,7 +65,7 @@ impl<P: Page> Pager<P> {
         Ok(())
     }
 
-    pub fn append_to_page<T: Serialize>(&mut self, val: &T) -> IoResult<AppendInfo> {
+    pub fn contigious_append_to_page<T: Serialize>(&mut self, val: &T) -> IoResult<AppendInfo> {
         let bytes = bincode::serialize(val)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
@@ -114,6 +114,52 @@ impl<P: Page> Pager<P> {
         } else {
             let current_bytes = current_page.get_page_bytes();
             current_bytes[current_offset..new_offset as usize].copy_from_slice(bytes.as_slice());
+        }
+
+        let current_page_last = self.pages.last().ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "Page not found".to_string(),
+        ))?;
+
+        let page_id = current_page_last.get_id();
+
+        let info = (page_id, self.current_offset, size);
+
+        self.current_offset += size % PAGE_SIZE;
+
+        Ok(info)
+    }
+
+    pub fn append_to_page<T: Serialize>(&mut self, val: T) -> IoResult<AppendInfo>
+    where
+        for<'a> T: serde::de::Deserialize<'a>,
+    {
+        let bytes = bincode::serialize(&val)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        let size = bytes.as_slice().len();
+        let current_offset = self.current_offset;
+        let new_offset = current_offset + size;
+
+        let current_page = self.pages.last_mut().ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "Page not found".to_string(),
+        ))?;
+
+        if new_offset < PAGE_SIZE {
+            let curr_bytes = current_page.get_page_bytes();
+            let mut curr_vec = deserialize_into_vectored_type::<T>(curr_bytes, current_offset)?;
+            curr_vec.push(val);
+            let vec_bytes = bincode::serialize(&curr_vec)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            curr_bytes[0..new_offset].copy_from_slice(vec_bytes.as_slice());
+        } else {
+            let buff = [0 as u8; PAGE_SIZE];
+            let mut page = P::new(current_page.get_id() + 1, buff);
+            let current_bytes = page.get_page_bytes();
+            current_bytes.copy_from_slice(bytes.as_slice());
+
+            self.pages.push(page);
         }
 
         let current_page_last = self.pages.last().ok_or(io::Error::new(

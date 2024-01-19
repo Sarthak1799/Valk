@@ -1131,7 +1131,7 @@ fn merge_two(
                 idx1 += 1;
                 idx2 += 1;
                 continue;
-            } else if one[idx1].header.timestamp < two[idx2].header.timestamp {
+            } else if one[idx1].header.timestamp > two[idx2].header.timestamp {
                 output.push(one[idx1].clone());
                 idx1 += 1;
             } else {

@@ -30,6 +30,7 @@ pub enum ValueType {
     StringType(String),
     NumberArray(Vec<i64>),
     StringArray(Vec<String>),
+    None,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

@@ -5,7 +5,10 @@ use std::{
 pub type IoResult<T> = Result<T, io::Error>;
 pub type GenericFindResult<T> = Result<T, types::GenericFindErrorKind>;
 pub use super::storage_types::ValueType;
-use crate::{constants::LOG_MANAGER_BUFFER_SIZE, global_types};
+use crate::{
+    constants::{LOG_MANAGER_BUFFER_SIZE, PAGE_SIZE},
+    global_types,
+};
 
 use super::{
     log_manager::VLogController,
@@ -95,11 +98,62 @@ impl Engine {
                 global_types::RequestType::Get(get_req) => {
                     self.get(get_req.key, req_id, global_sender.clone())
                 }
-                global_types::RequestType::Set(set_req) => {
-                    self.set(set_req.key, set_req.val, req_id, global_sender.clone())
-                }
+                global_types::RequestType::Set(set_req) => self.set(
+                    set_req.key,
+                    set_req.val,
+                    req_id,
+                    false,
+                    global_sender.clone(),
+                ),
+                global_types::RequestType::Delete(key) => self.set(
+                    key,
+                    types::ValueType::None,
+                    req_id,
+                    true,
+                    global_sender.clone(),
+                ),
             };
         })
+    }
+
+    fn get_val_aux(&self, key: String) -> IoResult<types::ValueLog> {
+        let exists_in_mem = self.log_controller.get(key.clone());
+
+        let response = match exists_in_mem {
+            Ok(val) => {
+                if val.record_type == types::RecordType::Delete {
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "not found".to_string(),
+                    ))
+                } else {
+                    Ok(val.clone())
+                }
+            }
+            Err(_e) => {
+                let res = self
+                    .bucket_controller
+                    .get(key, self.config.clone())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, "not found".to_string()))
+                    .and_then(|kval| {
+                        if kval.rec_type == types::RecordType::Delete {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "not found".to_string(),
+                            ));
+                        }
+
+                        self.log_controller
+                            .get_val_from_log::<types::ValueLog>(kval)
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::Other, "not found".to_string())
+                            })
+                            .and_then(|val| Ok(val[0].clone()))
+                    });
+                res
+            }
+        };
+        response
     }
 
     pub fn get(
@@ -117,12 +171,26 @@ impl Engine {
             let exists_in_mem = log_controller.get(key.clone());
 
             let response = match exists_in_mem {
-                Ok(val) => Ok(global_types::ResponseType::SuccessfulGet(val.value.clone())),
+                Ok(val) => {
+                    if val.record_type == types::RecordType::Delete {
+                        Err(global_types::GlobalError::Other(
+                            "Value not found".to_string(),
+                        ))
+                    } else {
+                        Ok(global_types::ResponseType::SuccessfulGet(val.value.clone()))
+                    }
+                }
                 Err(_e) => {
                     let res = bucket_controller
                         .get(key, config_clone)
                         .map_err(|e| global_types::GlobalError::Other(e.to_string()))
                         .and_then(|kval| {
+                            if kval.rec_type == types::RecordType::Delete {
+                                return Err(global_types::GlobalError::Other(
+                                    "Value not found".to_string(),
+                                ));
+                            }
+
                             log_controller
                                 .get_val_from_log::<types::ValueLog>(kval)
                                 .map_err(|e| global_types::GlobalError::Other(e.to_string()))
@@ -148,6 +216,7 @@ impl Engine {
         key: String,
         val: types::ValueType,
         req_id: u32,
+        delete_flag: bool,
         global_sender: mpsc::Sender<global_types::Response>,
     ) -> IoResult<()> {
         let log_controller = self.log_controller.clone();
@@ -156,7 +225,13 @@ impl Engine {
         let config_clone = self.config.clone();
 
         rayon::spawn(move || {
-            let log = types::ValueLog::new(key, val, types::RecordType::AppendOrUpdate);
+            let rec_type = if delete_flag {
+                types::RecordType::Delete
+            } else {
+                types::RecordType::AppendOrUpdate
+            };
+
+            let log = types::ValueLog::new(key, val, rec_type);
             let append_res = log_controller.append_log(log);
 
             let response = append_res
@@ -187,6 +262,37 @@ impl Engine {
             let res = global_types::Response::new(req_id, response);
             pass.send(res).unwrap();
         });
+
+        Ok(())
+    }
+
+    fn run_garbage_collector(&self) -> IoResult<()> {
+        let log_bytes = self.log_controller.get_log_input()?;
+        let mut merge_vec = Vec::new();
+        let mut update_entries = Vec::new();
+
+        for buf in log_bytes.chunks(PAGE_SIZE) {
+            let item = bincode::deserialize::<Vec<types::ValueLog>>(&buf)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+            merge_vec.extend(item);
+        }
+
+        for log in merge_vec {
+            let resp = self
+                .get_val_aux(log.key.clone())
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()));
+
+            if let Ok(val) = resp {
+                if val == log {
+                    update_entries.push(val);
+                }
+            }
+        }
+
+        for log in update_entries {
+            self.log_controller.append_log(log)?;
+        }
 
         Ok(())
     }

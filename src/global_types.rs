@@ -11,6 +11,7 @@ pub struct Request {
 pub enum RequestType {
     Get(GetRequest),
     Set(SetRequest),
+    Delete(String),
 }
 
 #[derive(Debug, Clone)]

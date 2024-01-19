@@ -1,3 +1,5 @@
+use crate::constants::GARBAGE_COLLECTION_DATA_SIZE;
+
 use super::{
     engine::IoResult,
     pager::Pager,
@@ -77,7 +79,13 @@ impl VLogController {
     pub fn append_log(&self, log: types::ValueLog) -> IoResult<()> {
         let pager = self.pager.clone();
         let metadata = self.metadata.clone();
-        self.current.append_log(pager, metadata, log)
+        let curr_val = self.read_flag()?;
+
+        if curr_val {
+            self.next.append_log(pager, metadata, log)
+        } else {
+            self.current.append_log(pager, metadata, log)
+        }
     }
 
     pub fn get_val_from_log<T>(&self, kval: types::KeyValOffset) -> IoResult<Vec<T>>
@@ -89,7 +97,13 @@ impl VLogController {
     }
 
     pub fn get(&self, key: String) -> IoResult<types::ValueLog> {
-        self.current.get(key)
+        let curr_val = self.read_flag()?;
+
+        if curr_val {
+            self.next.get(key)
+        } else {
+            self.current.get(key)
+        }
     }
 
     pub fn flip_flag(&self) -> IoResult<()> {
@@ -129,7 +143,30 @@ impl VLogController {
                 .get_compaction_inputs(hasher, Some((pager, metadata)))?
         };
 
+        self.flip_flag()?;
+
         Ok(inputs)
+    }
+
+    pub fn get_log_input(&self) -> IoResult<Vec<u8>> {
+        let reader = self
+            .metadata
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let head = reader.head_offset;
+        drop(reader);
+
+        let mut bytes = Vec::with_capacity(GARBAGE_COLLECTION_DATA_SIZE);
+        unsafe { bytes.set_len(GARBAGE_COLLECTION_DATA_SIZE) }
+
+        let page_reader = self
+            .pager
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        page_reader.read_arbitrary_from_offset(head, bytes.as_mut_slice())?;
+
+        Ok(bytes)
     }
 }
 
@@ -187,7 +224,7 @@ impl VLogManager {
             .write()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
-        let (page_id, val_offset, val_size) = page_writer.append_to_page(&log)?;
+        let (page_id, val_offset, val_size) = page_writer.append_to_page(log.clone())?;
         drop(page_writer);
 
         let timestamp = SystemTime::now()
