@@ -2,13 +2,15 @@
 
 use crate::{
     constants::SKIPLIST_MAX_LEVELS,
-    storage::{engine::IoResult, vlog_manager::ValueLog},
+    storage::{engine::IoResult, storage_types::ValueLog},
 };
 use fastrand as random;
 use std::{
     io,
     sync::{Arc, RwLock},
 };
+
+use super::storage_types;
 
 #[derive(Debug, Clone, PartialEq)]
 struct NodeData {
@@ -17,89 +19,62 @@ struct NodeData {
 }
 
 impl NodeData {
-    fn new(key: String, value: ValueLog) -> Self {
+    fn new(key: String, value: Arc<ValueLog>) -> Self {
+        Self { key, value }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeadNode {
+    level: i32,
+    next: Option<Arc<RwLock<Node>>>,
+    next_head: Option<Arc<RwLock<HeadNode>>>,
+}
+
+impl HeadNode {
+    pub fn new(level: i32) -> Self {
         Self {
-            key,
-            value: Arc::new(value),
+            level,
+            next: None,
+            next_head: None,
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum NodeType {
-    Node(Node),
-    Null,
-}
-
-impl NodeType {
-    fn get(&self) -> &Self {
-        self
+    pub fn set_next(&mut self, node: Option<Arc<RwLock<Node>>>) {
+        self.next = node;
     }
 
-    fn get_mut(&mut self) -> &mut Self {
-        self
+    pub fn set_next_head(&mut self, node: Option<Arc<RwLock<HeadNode>>>) {
+        self.next_head = node;
     }
 }
-
-#[derive(Debug, Clone)]
-struct NodeTypeLevelIter<'a> {
-    node: &'a NodeType,
-    idx: usize,
-}
-
-impl<'a> Iterator for NodeTypeLevelIter<'a> {
-    type Item = &'a Arc<RwLock<NodeType>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.node {
-            NodeType::Null => None,
-            NodeType::Node(n) => {
-                if self.idx < n.lvl_arr.len() {
-                    let out = &n.lvl_arr[self.idx];
-                    Some(out)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-// #[derive(Debug, Clone)]
-// struct HeadNode {
-//     max_level: i32,
-//     lvl_arr: Vec<Arc<RwLock<NodeType>>>,
-// }
-
-// impl HeadNode {
-//     fn new(lvl: i32) -> Self {
-//         let mut lvl_arr = Vec::with_capacity(lvl as usize);
-//         lvl_arr.resize_with(lvl as usize, || Arc::new(RwLock::new(NodeType::Null)));
-
-//         Self {
-//             max_level: lvl,
-//             lvl_arr,
-//         }
-//     }
-// }
 
 #[derive(Debug, Clone)]
 struct Node {
-    data: Option<NodeData>,
-    max_level: i32,
-    lvl_arr: Vec<Arc<RwLock<NodeType>>>,
+    data: NodeData,
+    level: i32,
+    next: Option<Arc<RwLock<Node>>>,
+    down: Option<Arc<RwLock<Node>>>,
 }
 
 impl Node {
-    pub fn new(lvl: i32, data: Option<NodeData>) -> Self {
-        let mut lvl_arr = Vec::with_capacity(lvl as usize);
-        lvl_arr.resize_with(lvl as usize, || Arc::new(RwLock::new(NodeType::Null)));
+    pub fn new(lvl: i32, val: Arc<ValueLog>) -> Self {
+        let data = NodeData::new(val.key.clone(), val);
 
         Self {
             data,
-            max_level: lvl,
-            lvl_arr,
+            level: lvl,
+            next: None,
+            down: None,
         }
+    }
+
+    pub fn set_next(&mut self, node: Option<Arc<RwLock<Node>>>) {
+        self.next = node;
+    }
+
+    pub fn set_down(&mut self, node: Option<Arc<RwLock<Node>>>) {
+        self.down = node;
     }
 }
 
@@ -113,106 +88,264 @@ fn random_level() -> i32 {
 
 #[derive(Debug)]
 pub struct SkipList {
-    pub size: i32,
-    pub max_level: i32,
-    pub head: Arc<RwLock<NodeType>>,
+    // pub size: i32,
+    // pub max_level: i32,
+    pub head: Arc<RwLock<HeadNode>>,
 }
 
 impl SkipList {
     pub fn new() -> Self {
         Self {
-            size: 0,
-            max_level: -1,
-            head: Arc::new(RwLock::new(NodeType::Null)),
+            head: Arc::new(RwLock::new(HeadNode::new(0))),
         }
     }
 
-    pub fn adjust_level(&mut self, new_lvl: i32) -> IoResult<()> {
-        let mut head_writer = self
-            .head
-            .write()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    fn search_util(&self, key: &String) -> IoResult<Vec<Arc<RwLock<Node>>>> {
+        let mut curr_head = self.head.clone();
+        let mut maybe_curr_node = None;
 
-        let temp = match head_writer.get() {
-            NodeType::Node(node) => node,
-            _ => {
-                return Err(io::Error::new(
+        while let Ok(reader) = curr_head.clone().read() {
+            if let Some(node) = reader.next_head.clone() {
+                curr_head = node.clone();
+            } else {
+                let nxt = reader.next.clone().ok_or(io::Error::new(
                     io::ErrorKind::Other,
-                    "Invalid head node config".to_string(),
-                ))
+                    "val not found".to_string(),
+                ))?;
+
+                maybe_curr_node = Some(nxt);
+                break;
             }
-        };
-
-        let prev_lvl = self.max_level;
-        let mut new_head = Node::new(new_lvl, None);
-
-        for idx in 0..prev_lvl {
-            new_head.lvl_arr[idx as usize] = temp.lvl_arr[idx as usize].clone();
         }
 
-        drop(head_writer);
+        let mut curr_node = maybe_curr_node.ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "Node not found".to_string(),
+        ))?;
 
-        self.max_level = new_lvl;
-        self.head = Arc::new(RwLock::new(NodeType::Node(new_head)));
+        let mut stack = Vec::new();
 
-        Ok(())
-    }
-
-    pub fn insert(&mut self, key: String, val: ValueLog) -> IoResult<()> {
-        let expected_lvl = random_level();
-
-        if expected_lvl > self.max_level {
-            self.adjust_level(expected_lvl)?;
-        }
-
-        let mut temp_node = self.head.clone();
-
-        let mut update_arr = Vec::with_capacity(expected_lvl as usize);
-
-        for lvl in (0..=self.max_level).rev() {
-            // let temp_reader = temp_node
-            //     .read()
-            //     .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-
-            // if let NodeType::Head(node) = temp_reader.get() {
-            //     let next_node = node.lvl_arr[lvl as usize].clone();
-
-            //     let node_reader = next_node
-            //         .read()
-            //         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-
-            //     if let NodeType::Node(next) = node_reader.get() {
-            //         if next.data.key < key {
-            //             drop(temp_reader);
-            //             temp_node = next_node.clone();
-            //         }
-            //     }
-            // }
-
-            // drop(temp_reader);
-            loop {
-                let temp_reader = temp_node
-                    .read()
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-
-                if let NodeType::Node(node) = temp_reader.get() {
-                    let next_node = node.lvl_arr[lvl as usize].clone();
-
-                    let node_reader = next_node
+        while let Ok(reader) = curr_node.clone().read() {
+            let val_equal = &reader.data.key == key;
+            let go_next = reader
+                .next
+                .as_ref()
+                .map(|nxt| -> IoResult<bool> {
+                    let next_reader = nxt
                         .read()
                         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = &next_reader.data.key <= key;
 
-                    if let NodeType::Node(next) = node_reader.get() {
-                        if let Some(da) = next.data {
-                            if da.key < key {
-                                drop(temp_reader);
-                                temp_node = next_node.clone();
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
+                    Ok(res)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            if val_equal {
+                stack.push(curr_node.clone());
+                return Ok(stack);
+            }
+
+            curr_node = if go_next {
+                reader.next.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "val not found".to_string(),
+                ))?
+            } else if let Some(node) = reader.down.clone() {
+                stack.push(curr_node.clone());
+                node
+            } else {
+                stack.push(curr_node.clone());
+                break;
+            };
+        }
+
+        Ok(stack)
+    }
+
+    pub fn search(&self, key: String) -> IoResult<storage_types::ValueType> {
+        let node = self
+            .search_util(&key)?
+            .last()
+            .ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "val not found".to_string(),
+            ))?
+            .clone();
+
+        let reader = node
+            .read()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+        if reader.data.key == key {
+            return Ok(reader.data.value.value.clone());
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "val not found".to_string(),
+        ))
+    }
+
+    fn check_and_set(
+        &self,
+        key: &String,
+        val: Arc<ValueLog>,
+        curr_node: Arc<RwLock<Node>>,
+        down_ref: Option<Arc<RwLock<Node>>>,
+        curr_lvl: i32,
+    ) -> IoResult<Option<Arc<RwLock<Node>>>> {
+        let mut node = curr_node.clone();
+        let mut res = None;
+
+        while let Ok(mut writer) = node.clone().write() {
+            let go_next = writer
+                .next
+                .as_ref()
+                .map(|nxt| -> IoResult<bool> {
+                    let next_reader = nxt
+                        .read()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = &next_reader.data.key <= key;
+
+                    Ok(res)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            node = if go_next {
+                writer.next.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "val not found".to_string(),
+                ))?
+            } else {
+                let mut new_node = Node::new(curr_lvl, val.clone());
+                new_node.set_next(writer.next.clone());
+                new_node.set_down(down_ref.clone());
+
+                writer.set_next(Some(Arc::new(RwLock::new(new_node))));
+                res = writer.next.clone();
+                break;
+            }
+        }
+
+        Ok(res)
+    }
+
+    fn check_and_set_level(
+        &self,
+        key: &String,
+        val: Arc<ValueLog>,
+        down_ref: Option<Arc<RwLock<Node>>>,
+        curr_lvl: i32,
+    ) -> IoResult<Option<Arc<RwLock<Node>>>> {
+        let mut node = self.head.clone();
+        let mut res = None;
+        let mut down_ref = down_ref.clone();
+
+        while let Ok(mut writer) = node.clone().write() {
+            let go_next = writer
+                .next_head
+                .as_ref()
+                .map(|nxt| -> IoResult<bool> {
+                    let next_reader = nxt
+                        .read()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = next_reader.level >= curr_lvl;
+
+                    Ok(res)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            node = if go_next {
+                let next_head = writer.next_head.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "val not found".to_string(),
+                ))?;
+
+                let next_node = writer.next.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "val not found".to_string(),
+                ))?;
+                let next_reader = next_node
+                    .read()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                let should_update = &next_reader.data.key > key;
+
+                down_ref = if should_update {
+                    let mut new_node = Node::new(curr_lvl, val.clone());
+                    new_node.set_next(Some(next_node.clone()));
+                    new_node.set_down(down_ref.clone());
+
+                    writer.set_next(Some(Arc::new(RwLock::new(new_node))));
+                    writer.next.clone()
+                } else {
+                    self.check_and_set(&key, val.clone(), next_node.clone(), down_ref, curr_lvl)?
+                };
+
+                next_head
+            } else {
+                let mut new_head = HeadNode::new(curr_lvl);
+                let mut new_node = Node::new(curr_lvl, val.clone());
+                new_node.set_down(down_ref.clone());
+
+                new_head.set_next(Some(Arc::new(RwLock::new(new_node))));
+                res = new_head.next.clone();
+
+                writer.set_next_head(Some(Arc::new(RwLock::new(new_head))));
+
+                break;
+            }
+        }
+
+        Ok(res)
+    }
+
+    pub fn insert(&self, key: String, val: Arc<ValueLog>) -> IoResult<()> {
+        let mut search_stack = self.search_util(&key)?;
+        let expected_level = random_level();
+        let mut curr_lvl = 0;
+        let mut new_node_down_ref = None;
+
+        let mut curr_node = search_stack
+            .pop()
+            .ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "Insert failed".to_string(),
+            ))?
+            .clone();
+
+        let exists = {
+            let reader = curr_node
+                .read()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+            reader.data.key == key
+        };
+
+        while let Ok(mut writer) = curr_node.clone().write() {
+            if exists {
+                writer.data.value = val.clone();
+
+                if let Some(node) = writer.down.clone() {
+                    curr_node = node;
+                } else {
+                    break;
+                }
+            } else {
+                new_node_down_ref = self.check_and_set(
+                    &key,
+                    val.clone(),
+                    curr_node,
+                    new_node_down_ref.clone(),
+                    curr_lvl,
+                )?;
+                curr_lvl += 1;
+
+                curr_node = if curr_lvl <= expected_level {
+                    if let Some(node) = search_stack.pop() {
+                        node.clone()
                     } else {
                         break;
                     }
@@ -220,37 +353,146 @@ impl SkipList {
                     break;
                 }
             }
-
-            update_arr.push(temp_node.clone());
         }
 
-        let data = NodeData::new(key, val);
-        let new_node = Node::new(expected_lvl, Some(data));
-        let mut arr = new_node.lvl_arr;
-        for lvl in 0..expected_lvl {
-            let update_node = update_arr[lvl as usize];
-            let node_writer = update_node
-                .write()
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        while curr_lvl <= expected_level {
+            // adjust levels
+            new_node_down_ref =
+                self.check_and_set_level(&key, val.clone(), new_node_down_ref.clone(), curr_lvl)?;
+            curr_lvl += 1;
+        }
 
-            let internal_node = node_writer.get();
+        Ok(())
+    }
 
-            arr[lvl as usize] = match internal_node {
-                NodeType::Node(node) => node.lvl_arr[lvl as usize].clone(),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Invalid head node config".to_string(),
-                    ))
-                }
-            };
+    pub fn remove(&self, key: String) -> IoResult<()> {
+        let mut curr_head = self.head.clone();
+        let mut head_stack = Vec::new();
+        let mut curr_node = None;
 
-            if let NodeType::Node(node) = internal_node {
-                node.lvl_arr[lvl as usize] = Arc::new(RwLock::new(NodeType::Node(new_node)));
+        while let Ok(reader) = curr_head.clone().read() {
+            head_stack.push(curr_head.clone());
+            if let Some(node) = reader.next_head.clone() {
+                curr_head = node.clone();
+            } else {
+                break;
             }
         }
 
-        self.size += 1;
+        while curr_node.is_none() {
+            if head_stack.is_empty() {
+                return Ok(());
+            }
+
+            let head = head_stack
+                .pop()
+                .ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Remove failed".to_string(),
+                ))?
+                .clone();
+
+            let mut key_node = None;
+
+            let mut writer = head
+                .write()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+            curr_node = writer
+                .next
+                .as_ref()
+                .map(|nxt| -> IoResult<Option<Arc<RwLock<Node>>>> {
+                    let next_reader = nxt
+                        .read()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = if next_reader.data.key < key {
+                        Some(nxt.clone())
+                    } else if next_reader.data.key == key {
+                        key_node = next_reader.next.clone();
+                        None
+                    } else {
+                        None
+                    };
+
+                    Ok(res)
+                })
+                .transpose()?
+                .flatten();
+
+            if let Some(node) = key_node {
+                let reader = node
+                    .read()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+
+                writer.next = reader.next.clone();
+            }
+        }
+
+        let mut node = curr_node
+            .ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "Remove failed".to_string(),
+            ))?
+            .clone();
+
+        while let Ok(mut writer) = node.clone().write() {
+            let should_update = writer
+                .next
+                .as_ref()
+                .map(|nxt| -> IoResult<bool> {
+                    let next_reader = nxt
+                        .read()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = next_reader.data.key == key;
+
+                    Ok(res)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            let go_next = writer
+                .next
+                .as_ref()
+                .map(|nxt| -> IoResult<bool> {
+                    let next_reader = nxt
+                        .read()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    let res = next_reader.data.key < key;
+
+                    Ok(res)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            if should_update {
+                let next_node = writer.next.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Remove failed".to_string(),
+                ))?;
+                let next_reader = next_node
+                    .read()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                writer.next = next_reader.next.clone();
+
+                node = if let Some(down) = writer.down.clone() {
+                    down
+                } else {
+                    break;
+                }
+            } else if go_next {
+                let next_node = writer.next.clone().ok_or(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Remove failed".to_string(),
+                ))?;
+
+                node = next_node;
+            } else if let Some(down) = writer.down.clone() {
+                node = down.clone()
+            } else {
+                break;
+            }
+        }
+
         Ok(())
     }
 }
